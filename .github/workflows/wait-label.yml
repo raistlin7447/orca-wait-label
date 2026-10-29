@@ -11,7 +11,7 @@ on:
         type: boolean
         default: false
       since:
-        description: Act on activity after this ISO time, less the quiet period (default: start of the last scheduled run)
+        description: 'Act on activity after this ISO time, less the quiet period (default: start of the last scheduled run)'
         required: false
 
 permissions:
