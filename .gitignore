@@ -1,0 +1,4 @@
+__pycache__/
+# The eval cases, the Opus reference judgments and the model runs judge named contributors' PRs; they stay local
+eval/cases.jsonl
+eval/data/

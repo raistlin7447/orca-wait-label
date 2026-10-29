@@ -1,0 +1,68 @@
+name: Wait for response label
+
+on:
+  schedule:
+    # GitHub does not allow a variable here
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Change labels (otherwise only log what would change)
+        type: boolean
+        default: false
+      since:
+        description: Act on activity after this ISO time, less the quiet period (default: start of the last scheduled run)
+        required: false
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: wait-label
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    # Scheduled runs take a minute or two; a manual catch-up over days of activity takes longer
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Claude Code
+        env:
+          VERSION: ${{ vars.WAIT_LABEL_CLAUDE_CODE_VERSION || '2.1.308' }}
+        run: npm install -g "@anthropic-ai/claude-code@$VERSION"
+
+      - name: Find where the last scheduled run left off
+        id: since
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SINCE: ${{ inputs.since }}
+        run: |
+          if [ -z "$SINCE" ]; then
+            SINCE=$(gh run list -R "$GITHUB_REPOSITORY" --workflow wait-label.yml --event schedule --status success -L 1 --json createdAt --jq '.[0].createdAt // empty')
+          fi
+          echo "since=${SINCE:-$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%SZ)}" >> "$GITHUB_OUTPUT"
+
+      - name: Sweep
+        env:
+          GH_TOKEN: ${{ secrets.WAIT_LABEL_GITHUB_TOKEN }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Scheduled runs change labels only once the repository variable WAIT_LABEL_APPLY is true
+          APPLY: ${{ (github.event_name == 'schedule' && vars.WAIT_LABEL_APPLY == 'true') || inputs.apply == true }}
+          SINCE: ${{ steps.since.outputs.since }}
+          # Unset repository variables arrive empty, and wait_label.py uses its defaults for them
+          WAIT_LABEL_REPO: ${{ vars.WAIT_LABEL_REPO }}
+          WAIT_LABEL_LABEL: ${{ vars.WAIT_LABEL_LABEL }}
+          WAIT_LABEL_TEAM_ASSOCIATIONS: ${{ vars.WAIT_LABEL_TEAM_ASSOCIATIONS }}
+          WAIT_LABEL_IGNORED_USERS: ${{ vars.WAIT_LABEL_IGNORED_USERS }}
+          WAIT_LABEL_COMMAND_PREFIX: ${{ vars.WAIT_LABEL_COMMAND_PREFIX }}
+          WAIT_LABEL_MODEL: ${{ vars.WAIT_LABEL_MODEL }}
+          WAIT_LABEL_CONFIRMATIONS: ${{ vars.WAIT_LABEL_CONFIRMATIONS }}
+          WAIT_LABEL_QUIET_MINUTES: ${{ vars.WAIT_LABEL_QUIET_MINUTES }}
+          WAIT_LABEL_CONTEXT_MESSAGES: ${{ vars.WAIT_LABEL_CONTEXT_MESSAGES }}
+          WAIT_LABEL_MAX_TEXT: ${{ vars.WAIT_LABEL_MAX_TEXT }}
+          WAIT_LABEL_LABEL_DRAFTS: ${{ vars.WAIT_LABEL_LABEL_DRAFTS }}
+          WAIT_LABEL_PROMPT_FILE: ${{ vars.WAIT_LABEL_PROMPT_FILE }}
+        run: python3 wait_label.py --since "$SINCE" $([ "$APPLY" = true ] && echo --apply)
