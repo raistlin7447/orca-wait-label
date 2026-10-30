@@ -2,8 +2,8 @@ name: Wait for response label
 
 on:
   schedule:
-    # GitHub does not allow a variable here. After the workflow is disabled and enabled again, the schedule may not run until a commit changes this file
-    - cron: '*/10 * * * *'
+    # GitHub does not allow a variable here. Every 10 minutes, offset from the top of the hour, when GitHub delays scheduled runs the most
+    - cron: '7-57/10 * * * *'
   workflow_dispatch:
     inputs:
       apply:
