@@ -18,7 +18,13 @@ Repository secrets:
 - `CLAUDE_CODE_OAUTH_TOKEN`: from `claude setup-token`.
 - `WAIT_LABEL_GITHUB_TOKEN`: a GitHub token that can add labels on the target repository.
 
-Scheduled runs only log what they would change until the repository variable `WAIT_LABEL_APPLY` is `true`. A manual run from the Actions tab has an `apply` switch and a `since` time, for catching up after a gap.
+Scheduled runs only log what they would change until the repository variable `WAIT_LABEL_APPLY` is `true`. A manual run from the Actions tab has an `apply` switch and a `since` time, for catching up after a gap. Each run starts where the last run that changed labels left off.
+
+GitHub can run a schedule far less often than asked, especially on a repository with little activity. A timer elsewhere can start the workflow instead, for example a Windows scheduled task:
+
+```bat
+schtasks /create /tn orca-wait-label /sc minute /mo 10 /tr "conhost.exe --headless \"C:\Program Files\GitHub CLI\gh.exe\" workflow run wait-label.yml -R <owner>/<repo> -f apply=true"
+```
 
 ## Settings
 

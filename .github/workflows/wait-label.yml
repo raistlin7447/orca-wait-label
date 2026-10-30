@@ -1,4 +1,6 @@
 name: Wait for response label
+# The next run starts where the last run that changed labels left off, and finds it by this title
+run-name: ${{ ((github.event_name == 'schedule' && vars.WAIT_LABEL_APPLY == 'true') || inputs.apply) && 'Apply' || 'Dry run' }}
 
 on:
   schedule:
@@ -11,7 +13,7 @@ on:
         type: boolean
         default: false
       since:
-        description: 'Act on activity after this ISO time, less the quiet period (default: start of the last scheduled run)'
+        description: 'Act on activity after this ISO time, less the quiet period (default: start of the last run that changed labels)'
         required: false
 
 permissions:
@@ -34,14 +36,14 @@ jobs:
           VERSION: ${{ vars.WAIT_LABEL_CLAUDE_CODE_VERSION || '2.1.308' }}
         run: npm install -g "@anthropic-ai/claude-code@$VERSION"
 
-      - name: Find where the last scheduled run left off
+      - name: Find where the last run that changed labels left off
         id: since
         env:
           GH_TOKEN: ${{ github.token }}
           SINCE: ${{ inputs.since }}
         run: |
           if [ -z "$SINCE" ]; then
-            SINCE=$(gh run list -R "$GITHUB_REPOSITORY" --workflow wait-label.yml --event schedule --status success -L 1 --json createdAt --jq '.[0].createdAt // empty')
+            SINCE=$(gh run list -R "$GITHUB_REPOSITORY" --workflow wait-label.yml --status success -L 50 --json createdAt,displayTitle --jq '[.[] | select(.displayTitle == "Apply")][0].createdAt // empty')
           fi
           echo "since=${SINCE:-$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%SZ)}" >> "$GITHUB_OUTPUT"
 
