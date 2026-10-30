@@ -2,7 +2,7 @@ name: Wait for response label
 
 on:
   schedule:
-    # GitHub does not allow a variable here
+    # GitHub does not allow a variable here. After the workflow is disabled and enabled again, the schedule may not run until a commit changes this file
     - cron: '*/10 * * * *'
   workflow_dispatch:
     inputs:
