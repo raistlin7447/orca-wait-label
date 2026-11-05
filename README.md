@@ -1,60 +1,224 @@
-# orca-wait-label
+# Waiting on Author Label
 
-Keeps the `wait for response` label on [OrcaSlicer](https://github.com/OrcaSlicer/OrcaSlicer) pull requests in step with who owes the next reply. The label means the team asked the PR author for something, so open PRs without it are the review queue. The repository, the label and the other choices are [settings](#settings), so it can run on another repository too.
+A GitHub Action that labels pull requests waiting on their author. Open PRs without the label are your review queue.
+
+People forget to add and remove a label like this, so a model reads the conversation and does it for them. The label stays on after a reply like "thanks, I'll fix that this week" and comes off when the fix is pushed.
+
+The Action runs on your own runner with your own tokens. It never runs PR code, and the model has no tools. PR titles and recent messages are sent to the model service you choose.
+
+## Quick start
+
+Pick the setup that fits, add the workflow as `.github/workflows/waiting-on-author.yml`, then follow [After setup](#after-setup).
+
+### Copilot in a personal repository
+
+Create a [fine-grained token](https://github.com/settings/personal-access-tokens/new) owned by your personal account, with the **Copilot Requests** account permission. Add it as a repository secret named `COPILOT_TOKEN`. The Action uses that person's Copilot allowance, and the Free plan can't choose a model.
+
+```yaml
+name: Waiting on author
+
+on:
+  schedule:
+    - cron: '7 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  # To create the label if it is missing
+  issues: write
+
+concurrency:
+  group: waiting-on-author
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: raistlin7447/orca-wait-label@v1
+        with:
+          copilot-token: ${{ secrets.COPILOT_TOKEN }}
+          # Change to false when the log looks right
+          dry-run: true
+```
+
+### Copilot in an organization repository
+
+No secret is needed. The organization needs a Copilot plan, and its "Allow use of Copilot CLI billed to the organization" policy must be on. The organization is billed. This setup hasn't been tested yet.
+
+```yaml
+name: Waiting on author
+
+on:
+  schedule:
+    - cron: '7 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  # To create the label if it is missing
+  issues: write
+  copilot-requests: write
+
+concurrency:
+  group: waiting-on-author
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: raistlin7447/orca-wait-label@v1
+        with:
+          # Uses the workflow token, so no token input is needed
+          # Change to false when the log looks right
+          dry-run: true
+```
+
+### Claude
+
+Add a repository secret named `CLAUDE_CODE_OAUTH_TOKEN`, with a token from `claude setup-token`. To use an API key, set `anthropic-api-key` instead.
+
+```yaml
+name: Waiting on author
+
+on:
+  schedule:
+    - cron: '7 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  # To create the label if it is missing
+  issues: write
+
+concurrency:
+  group: waiting-on-author
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: raistlin7447/orca-wait-label@v1
+        with:
+          provider: claude
+          claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Change to false when the log looks right
+          dry-run: true
+```
+
+### After setup
+
+1. Run the workflow from the Actions tab and read the log. With `dry-run: true`, it only logs what it would change.
+2. Change `dry-run` to `false` when the log looks right.
+
+The first runs work through every open PR, oldest first, 20 PRs at a time, and later runs only look at new activity. The `held` count in the log shows how many are left. An hourly schedule gets through about 480 PRs a day, and you can raise `max-judgments` or run the workflow by hand to go faster. Dry runs and real runs keep separate progress, so the first real run starts again from the oldest PR.
+
+The Action needs a Linux or macOS runner with `gh` and `python3`, version 3.11 or newer for Copilot. `ubuntu-latest` has them.
+
+To stop the code that handles your token from changing, pin the Action to a commit SHA instead of `@v1`.
+
+On a repository with little activity, GitHub can run a schedule far less often than you asked. Labels update later in that case, and each run still starts where the last one stopped. A timer elsewhere can also start the workflow, with `gh workflow run`.
+
+Model names differ between providers, such as `claude-sonnet-5.5` on Copilot and `claude-sonnet-5-5` on Claude.
 
 ## How it decides
 
-Every 10 minutes, `wait_label.py` looks at open PRs with new activity from the PR author or a team member (anyone with write access). Bots and `/bot` commands are ignored. A PR is judged once its conversation has been quiet for 30 minutes (by default), so a quick back-and-forth is judged once, at the end.
+Each run looks at open PRs with new activity from the PR author or a team member. Bots are ignored. A PR is judged once its conversation has been quiet for 30 minutes (by default), so a quick back-and-forth is judged once, at the end.
 
+- A PR without the label is skipped until a team member has spoken, which costs no model call.
 - A commit by the author after the label was added removes it.
-- Otherwise Claude reads the last few messages and answers one question: is the review waiting on the PR author? The label follows the answer.
-- A "waiting" answer has to hold on three calls in a row (by default). When the answer is unclear, the label stays off, because a wrong label hides a PR that is waiting on us.
-- A label change made after the latest activity, by a person or by this bot, is left alone until there is new activity. The bot never adds the label to a draft.
+- Otherwise the model reads the last few messages and decides whether the review is waiting on the PR author, and the label is set to match.
+- A "waiting" answer has to come back three times in a row (by default). If the calls disagree, the PR counts as not waiting, because a wrong label takes a PR out of your review queue.
+- A label change made after the latest activity, by a person or by this Action, is left alone until there is new activity.
+- The Action never adds the label to a draft (by default).
+- A PR that can't be judged is left as it is until its next activity. If every judgment in a run fails, the run fails and the next run tries them again.
 
-## Setup
+## Inputs
 
-Repository secrets:
+| Input | Default | What it controls |
+|---|---|---|
+| `provider` | `copilot` | `copilot` or `claude` |
+| `copilot-token` | (`github-token`) | Token for Copilot |
+| `claude-code-oauth-token` | | Token from `claude setup-token` |
+| `anthropic-api-key` | | Anthropic API key, instead of the OAuth token |
+| `github-token` | `github.token` | Token that can read PRs and change labels |
+| `repository` | this repository | The repository whose PRs get the label |
+| `dry-run` | `true` | Only log what would change |
+| `since` | | Judge activity after this ISO time, instead of where the last run stopped |
+| `lookback-hours` | `0` | How far back to look when no earlier run says where it stopped. `0` means every open PR, oldest first |
+| `label` | `waiting on author` | The label's name. It is created if it is missing |
+| `label-color` | `fbca04` | The color for a label this Action creates |
+| `label-drafts` | `false` | Whether the label can be added to draft PRs |
+| `team-associations` | `OWNER,MEMBER,COLLABORATOR` | Who counts as the team, by GitHub's author association |
+| `team-users` | | Comma-separated logins that also count as the team |
+| `ignored-users` | `github-actions,copilot-pull-request-reviewer,Copilot,coderabbitai,dependabot` | Accounts whose comments are ignored, besides any `[bot]` account |
+| `command-prefix` | | Comments starting with this are commands to another bot, not conversation |
+| `model` | `claude-sonnet-5-5` for `claude`, Copilot's pick for `copilot` | The model that judges |
+| `confirmations` | `2` | Extra calls that must agree before a "waiting" answer stands |
+| `quiet-minutes` | `30` | How long a conversation must be quiet before it is judged |
+| `context-messages` | `6` | How many recent messages the model reads |
+| `max-text` | `2000` | Characters kept from each message |
+| `max-judgments` | `20` | PRs judged per run, with the rest held for the next run. `0` means no limit |
+| `model-timeout` | `300` | Seconds to wait for each model call |
+| `effort` | | Reasoning effort, from `low`, `medium`, `high`, `xhigh` and `max`. Empty leaves the provider's default |
+| `github-tries` | `3` | How many times to try a GitHub search before giving up |
+| `github-retry-delay` | `10` | Seconds to wait between tries |
+| `max-comments` | `30` | Comments fetched per PR, newest first. `context-messages` can only read what these limits fetch |
+| `max-reviews` | `20` | Reviews fetched per PR, newest first |
+| `max-review-comments` | `20` | Inline comments fetched per review |
+| `max-commits` | `10` | Commits fetched per PR, newest first |
+| `max-label-events` | `30` | Label changes fetched per PR, newest first |
+| `prompt-file` | (built in) | A file with your own instructions for the model; check out your repository first. `{project}` becomes the repository name |
+| `log-reasons` | `false` | Log the model's reason for each PR. Actions logs are public on a public repository |
+| `claude-code-version` | `2.1.318` | The Claude Code CLI version to install |
+| `copilot-sdk-version` | `1.0.28` | The Copilot SDK version to install |
 
-- `CLAUDE_CODE_OAUTH_TOKEN`: from `claude setup-token`.
-- `WAIT_LABEL_GITHUB_TOKEN`: a GitHub token that can add labels on the target repository.
+The schedule is in your own workflow file, so you set that there too.
 
-Scheduled runs only log what they would change until the repository variable `WAIT_LABEL_APPLY` is `true`. A manual run from the Actions tab has an `apply` switch and a `since` time, for catching up after a gap. Each run starts where the last run that changed labels left off.
+## Outputs
 
-GitHub can run a schedule far less often than asked, especially on a repository with little activity. A timer elsewhere can start the workflow instead, for example a Windows scheduled task:
+Every run writes its totals to the log and the job summary, and sets these outputs:
 
-```bat
-schtasks /create /tn orca-wait-label /sc minute /mo 10 /tr "conhost.exe --headless \"C:\Program Files\GitHub CLI\gh.exe\" workflow run wait-label.yml -R <owner>/<repo> -f apply=true"
+| Output | Contains |
+|---|---|
+| `added`, `removed` | Comma-separated PR numbers |
+| `judged`, `held`, `failures` | PR counts |
+| `model-calls` | Calls made to the model |
+| `input-tokens`, `output-tokens` | Tokens used |
+| `cost-usd` | Claude's reported cost at list price. On a subscription token this is an estimate, not a bill |
+| `ai-credits` | Copilot AI credits used |
+
+The totals contain no PR text. In our test, a call used about 0.3 AI credits with Sonnet 5.5, and a PR takes up to 1 + `confirmations` calls.
+
+## Closing abandoned PRs
+
+To close PRs that never get a reply, point [`actions/stale`](https://github.com/actions/stale) at the label:
+
+```yaml
+- uses: actions/stale@v11
+  with:
+    only-pr-labels: waiting on author
+    days-before-pr-stale: 90
+    days-before-pr-close: 14
+    # Without these two, actions/stale also closes old issues
+    days-before-issue-stale: -1
+    days-before-issue-close: -1
 ```
 
-## Settings
+## Reliability
 
-Each setting is a repository variable that the workflow passes to `wait_label.py`, which reads it from the environment. An unset variable uses the default. The schedule is the one exception: it is in `.github/workflows/wait-label.yml`, because GitHub does not allow a variable there.
+`eval/` builds cases from the history of open PRs, runs a model on them with the same call the Action makes, and scores the result against reference judgments. The cases and judgments aren't in this repository, because they're about named contributors' PRs.
 
-| Variable | Default | What it controls |
-|---|---|---|
-| `WAIT_LABEL_REPO` | `OrcaSlicer/OrcaSlicer` | The repository whose PRs get the label |
-| `WAIT_LABEL_LABEL` | `wait for response` | The label's name |
-| `WAIT_LABEL_TEAM_ASSOCIATIONS` | `OWNER,MEMBER,COLLABORATOR` | Who counts as the team, by GitHub's author association |
-| `WAIT_LABEL_IGNORED_USERS` | `github-actions,copilot-pull-request-reviewer,Copilot,coderabbitai,dependabot` | Accounts whose comments are ignored, besides any `[bot]` account |
-| `WAIT_LABEL_COMMAND_PREFIX` | `/bot` | Comments starting with this are commands, not conversation |
-| `WAIT_LABEL_MODEL` | `claude-sonnet-5-5` | The Claude model that judges |
-| `WAIT_LABEL_CONFIRMATIONS` | `2` | Extra calls that must agree before a "waiting" answer stands |
-| `WAIT_LABEL_QUIET_MINUTES` | `30` | How long a conversation must be quiet before it is judged |
-| `WAIT_LABEL_CONTEXT_MESSAGES` | `6` | How many recent messages Claude reads |
-| `WAIT_LABEL_MAX_TEXT` | `2000` | Characters kept from each message |
-| `WAIT_LABEL_LABEL_DRAFTS` | `false` | Whether the label can be added to draft PRs |
-| `WAIT_LABEL_PROMPT_FILE` | (built in) | A file with your own instructions for Claude; `{project}` becomes the repository name |
-| `WAIT_LABEL_CLAUDE_CODE_VERSION` | `2.1.308` | The Claude Code CLI version the workflow installs |
-| `WAIT_LABEL_APPLY` | (unset) | `true` lets scheduled runs change labels |
+We compared Sonnet 5.5 with reference judgments on 200 cases from one repository, with three calls required to agree. It said "waiting" on 3 cases where the reference did not, and missed 1 of 76 clear waits. The Claude CLI and the Copilot SDK scored the same. No Free plan account has been tested, so start with a dry run on your repository.
 
 ## Running locally
 
 ```bash
-python3 wait_label.py --since 2026-10-27T00:00:00Z --verbose
+python3 -m unittest discover -s tests
+pip install github-copilot-sdk
+WAIT_LABEL_REPO=owner/name WAIT_LABEL_LOG_REASONS=true python3 wait_label.py --since 2026-10-27T00:00:00Z
 ```
 
-Without `--apply` it changes nothing. `--verbose` prints each verdict with Claude's reason; the workflow leaves it off, since its log is public.
-
-## Eval
-
-`eval/` builds cases from the history of open PRs, runs a model on them with the same call the bot makes, and scores the result against reference judgments. The cases and judgments stay local because they judge named contributors' PRs.
+Without `--apply` it changes nothing. It uses your `gh` login, and the provider's token from `WAIT_LABEL_COPILOT_TOKEN`, or from `CLAUDE_CODE_OAUTH_TOKEN` with `WAIT_LABEL_PROVIDER=claude`.

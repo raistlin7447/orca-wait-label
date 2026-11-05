@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runs the bot's real classifier call on every eval case: run_model.py <model> <runs>.
+"""Runs the bot's real Claude call on every eval case: run_model.py <model> <runs>.
 
 Each case is one fresh `claude -p` call, as in production, with the same WAIT_LABEL_* settings. Reads the
 OAuth token from the file named by WAIT_LABEL_TOKEN_FILE and passes it only to the claude process. Writes data/runs/<model>_run<N>.jsonl
@@ -20,6 +20,7 @@ WORKERS = 4
 def main():
     model, runs = sys.argv[1], int(sys.argv[2])
     os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = open(os.environ["WAIT_LABEL_TOKEN_FILE"], encoding="utf-8").read().strip()
+    classifier = w.ClaudeModel(model, w.SYSTEM_PROMPT, w.SCHEMA, w.CLAUDE_BIN)
     cases = [json.loads(l) for l in open(os.path.join(HERE, "cases.jsonl"), encoding="utf-8")]
     os.makedirs(os.path.join(HERE, "data", "runs"), exist_ok=True)
 
@@ -30,7 +31,7 @@ def main():
 
         def judge(case):
             try:
-                v = w.classify(case["prompt"], model)
+                v, _ = classifier.judge(case["prompt"])
                 return {"id": case["id"], "waiting_on_author": v["waiting_on_author"], "reason": v["reason"]}
             except Exception as error:
                 print(f"case {case['id']}: {error}", file=sys.stderr)

@@ -1,0 +1,216 @@
+name: Waiting on Author Label
+description: Keeps a label on pull requests in step with whether the review is waiting on the PR author
+branding:
+  icon: tag
+  color: yellow
+
+inputs:
+  provider:
+    description: Which model service judges, copilot or claude
+    default: copilot
+  copilot-token:
+    description: Fine-grained token with the Copilot Requests permission. In an organization repository, leave it empty to use github-token with the copilot-requests permission
+    default: ''
+  claude-code-oauth-token:
+    description: Token from `claude setup-token`
+    default: ''
+  anthropic-api-key:
+    description: Anthropic API key, instead of claude-code-oauth-token
+    default: ''
+  github-token:
+    description: Token that can read PRs and change labels on the target repository
+    default: ${{ github.token }}
+  repository:
+    description: The repository whose PRs get the label, as owner/name
+    default: ${{ github.repository }}
+  dry-run:
+    description: Only log what would change. Set it to false once the log looks right
+    default: 'true'
+  since:
+    description: Judge activity after this ISO time, instead of where the last run stopped, to catch up after a gap
+    default: ''
+  lookback-hours:
+    description: How far back to look when no earlier run says where it stopped. 0 means every open PR, oldest first
+    default: '0'
+  label:
+    description: The label's name. It is created if it is missing
+    default: waiting on author
+  label-color:
+    description: The color for a label this action creates
+    default: fbca04
+  label-drafts:
+    description: Whether the label can be added to draft PRs
+    default: 'false'
+  team-associations:
+    description: Who counts as the team, by GitHub's author association
+    default: OWNER,MEMBER,COLLABORATOR
+  team-users:
+    description: Comma-separated logins that also count as the team
+    default: ''
+  ignored-users:
+    description: Accounts whose comments are ignored, besides any [bot] account
+    default: github-actions,copilot-pull-request-reviewer,Copilot,coderabbitai,dependabot
+  command-prefix:
+    description: Comments starting with this are commands to another bot, not conversation
+    default: ''
+  model:
+    description: The model that judges. The default is claude-sonnet-5-5 for claude, and Copilot's own pick for copilot
+    default: ''
+  confirmations:
+    description: Extra calls that must agree before a "waiting" answer stands
+    default: '2'
+  quiet-minutes:
+    description: How long a conversation must be quiet before it is judged
+    default: '30'
+  context-messages:
+    description: How many recent messages the model reads
+    default: '6'
+  max-text:
+    description: Characters kept from each message
+    default: '2000'
+  max-judgments:
+    description: PRs judged per run, with the rest held for the next run. 0 means no limit
+    default: '20'
+  model-timeout:
+    description: Seconds to wait for each model call
+    default: '300'
+  effort:
+    description: Reasoning effort for the model, from low, medium, high, xhigh and max. Empty leaves the provider's default
+    default: ''
+  github-tries:
+    description: How many times to try a GitHub search before giving up
+    default: '3'
+  github-retry-delay:
+    description: Seconds to wait between tries
+    default: '10'
+  max-comments:
+    description: Comments fetched per PR, newest first. context-messages can only read what these limits fetch
+    default: '30'
+  max-reviews:
+    description: Reviews fetched per PR, newest first
+    default: '20'
+  max-review-comments:
+    description: Inline comments fetched per review
+    default: '20'
+  max-commits:
+    description: Commits fetched per PR, newest first
+    default: '10'
+  max-label-events:
+    description: Label changes fetched per PR, newest first
+    default: '30'
+  prompt-file:
+    description: A file in the repository with your own instructions for the model. {project} becomes the repository name
+    default: ''
+  log-reasons:
+    description: Log the model's reason for each PR. Actions logs are public on a public repository
+    default: 'false'
+  claude-code-version:
+    description: The Claude Code CLI version to install
+    default: 2.1.318
+  copilot-sdk-version:
+    description: The Copilot SDK version to install
+    default: 1.0.28
+
+outputs:
+  added:
+    description: Comma-separated PR numbers that got the label
+    value: ${{ steps.sweep.outputs.added }}
+  removed:
+    description: Comma-separated PR numbers that lost the label
+    value: ${{ steps.sweep.outputs.removed }}
+  judged:
+    description: PRs judged
+    value: ${{ steps.sweep.outputs.judged }}
+  held:
+    description: PRs held for the next run by max-judgments
+    value: ${{ steps.sweep.outputs.held }}
+  failures:
+    description: PRs that could not be judged
+    value: ${{ steps.sweep.outputs.failures }}
+  model-calls:
+    description: Calls made to the model
+    value: ${{ steps.sweep.outputs.model-calls }}
+  input-tokens:
+    description: Input tokens used, including cached ones
+    value: ${{ steps.sweep.outputs.input-tokens }}
+  output-tokens:
+    description: Output tokens used
+    value: ${{ steps.sweep.outputs.output-tokens }}
+  cost-usd:
+    description: Claude's reported cost at list price. On a subscription token this is an estimate, not a bill
+    value: ${{ steps.sweep.outputs.cost-usd }}
+  ai-credits:
+    description: Copilot AI credits used
+    value: ${{ steps.sweep.outputs.ai-credits }}
+
+runs:
+  using: composite
+  steps:
+    # The state file says where the last run stopped. Dry runs keep their own, so a real run starts from the beginning
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/wait-label-state
+        key: wait-label-${{ inputs.repository }}-${{ inputs.label }}-${{ inputs.dry-run }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: wait-label-${{ inputs.repository }}-${{ inputs.label }}-${{ inputs.dry-run }}-
+
+    - name: Install Claude Code
+      if: inputs.provider == 'claude'
+      shell: bash
+      env:
+        VERSION: ${{ inputs.claude-code-version }}
+      run: npm install -g "@anthropic-ai/claude-code@$VERSION"
+
+    - name: Install the Copilot SDK
+      if: inputs.provider == 'copilot'
+      shell: bash
+      env:
+        VERSION: ${{ inputs.copilot-sdk-version }}
+      run: |
+        python3 -m venv "$RUNNER_TEMP/wait-label-venv"
+        "$RUNNER_TEMP/wait-label-venv/bin/pip" install --quiet "github-copilot-sdk==$VERSION"
+        echo "$RUNNER_TEMP/wait-label-venv/bin" >> "$GITHUB_PATH"
+
+    - name: Sweep
+      id: sweep
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude-code-oauth-token }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        WAIT_LABEL_COPILOT_TOKEN: ${{ inputs.copilot-token || inputs.github-token }}
+        WAIT_LABEL_PROVIDER: ${{ inputs.provider }}
+        WAIT_LABEL_REPO: ${{ inputs.repository }}
+        WAIT_LABEL_DRY_RUN: ${{ inputs.dry-run }}
+        WAIT_LABEL_SINCE: ${{ inputs.since }}
+        WAIT_LABEL_LOOKBACK_HOURS: ${{ inputs.lookback-hours }}
+        WAIT_LABEL_LABEL: ${{ inputs.label }}
+        WAIT_LABEL_LABEL_COLOR: ${{ inputs.label-color }}
+        WAIT_LABEL_LABEL_DRAFTS: ${{ inputs.label-drafts }}
+        WAIT_LABEL_TEAM_ASSOCIATIONS: ${{ inputs.team-associations }}
+        WAIT_LABEL_TEAM_USERS: ${{ inputs.team-users }}
+        WAIT_LABEL_IGNORED_USERS: ${{ inputs.ignored-users }}
+        WAIT_LABEL_COMMAND_PREFIX: ${{ inputs.command-prefix }}
+        WAIT_LABEL_MODEL: ${{ inputs.model }}
+        WAIT_LABEL_CONFIRMATIONS: ${{ inputs.confirmations }}
+        WAIT_LABEL_QUIET_MINUTES: ${{ inputs.quiet-minutes }}
+        WAIT_LABEL_CONTEXT_MESSAGES: ${{ inputs.context-messages }}
+        WAIT_LABEL_MAX_TEXT: ${{ inputs.max-text }}
+        WAIT_LABEL_MAX_JUDGMENTS: ${{ inputs.max-judgments }}
+        WAIT_LABEL_MODEL_TIMEOUT: ${{ inputs.model-timeout }}
+        WAIT_LABEL_EFFORT: ${{ inputs.effort }}
+        WAIT_LABEL_GITHUB_TRIES: ${{ inputs.github-tries }}
+        WAIT_LABEL_GITHUB_RETRY_DELAY: ${{ inputs.github-retry-delay }}
+        WAIT_LABEL_MAX_COMMENTS: ${{ inputs.max-comments }}
+        WAIT_LABEL_MAX_REVIEWS: ${{ inputs.max-reviews }}
+        WAIT_LABEL_MAX_REVIEW_COMMENTS: ${{ inputs.max-review-comments }}
+        WAIT_LABEL_MAX_COMMITS: ${{ inputs.max-commits }}
+        WAIT_LABEL_MAX_LABEL_EVENTS: ${{ inputs.max-label-events }}
+        WAIT_LABEL_PROMPT_FILE: ${{ inputs.prompt-file }}
+        WAIT_LABEL_LOG_REASONS: ${{ inputs.log-reasons }}
+        WAIT_LABEL_STATE_FILE: ${{ runner.temp }}/wait-label-state/state.json
+      run: python3 "$GITHUB_ACTION_PATH/wait_label.py"
+
+    - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/wait-label-state
+        key: wait-label-${{ inputs.repository }}-${{ inputs.label }}-${{ inputs.dry-run }}-${{ github.run_id }}-${{ github.run_attempt }}
