@@ -15,11 +15,11 @@ import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
-from models import ClaudeModel, CopilotModel, Usage
+from models import ClaudeModel, CopilotModel, Usage, install
 
 
 def setting(name, default):
-    # The workflow passes unset repository variables as empty strings
+    # An input left empty in action.yml arrives as an empty string
     return os.environ.get(f"WAIT_LABEL_{name}") or default
 
 
@@ -27,17 +27,26 @@ def setting_list(name, default):
     return {s.strip() for s in setting(name, default).split(",") if s.strip()}
 
 
+def login_list(name, default):
+    # GitHub logins are case-insensitive
+    return {s.lower() for s in setting_list(name, default)}
+
+
 REPO_OWNER, REPO_NAME = setting("REPO", os.environ.get("GITHUB_REPOSITORY", "/")).split("/")
 LABEL = setting("LABEL", "waiting on author")
 LABEL_COLOR = setting("LABEL_COLOR", "fbca04")
 # Comment and review associations that count as the team
-TEAM = setting_list("TEAM_ASSOCIATIONS", "OWNER,MEMBER,COLLABORATOR")
-# People who count as the team whatever their association says
-TEAM_USERS = setting_list("TEAM_USERS", "")
-IGNORED_USERS = setting_list("IGNORED_USERS", "github-actions,copilot-pull-request-reviewer,Copilot,coderabbitai,dependabot")
+TEAM = {s.upper() for s in setting_list("TEAM_ASSOCIATIONS", "OWNER,MEMBER,COLLABORATOR")}
+# Logins that count as the team, whatever their association
+TEAM_USERS = login_list("TEAM_USERS", "")
+IGNORED_USERS = login_list("IGNORED_USERS", "github-actions,copilot-pull-request-reviewer,Copilot,coderabbitai,dependabot")
 # Comments starting with this are commands to another bot, not conversation
 COMMAND_PREFIX = setting("COMMAND_PREFIX", "")
 PROVIDER = setting("PROVIDER", "copilot")
+# The Action installs the provider's tools only once a run has something to judge
+INSTALL = setting("INSTALL", "false") == "true"
+CLAUDE_CODE_VERSION = setting("CLAUDE_CODE_VERSION", "2.1.318")
+COPILOT_SDK_VERSION = setting("COPILOT_SDK_VERSION", "1.0.28")
 # Empty lets Copilot pick, the only choice on its Free plan
 MODEL = setting("MODEL", "claude-sonnet-5-5" if PROVIDER == "claude" else "")
 CLAUDE_BIN = setting("CLAUDE_BIN", "claude")
@@ -47,9 +56,9 @@ QUIET_MINUTES = int(setting("QUIET_MINUTES", "30"))
 CONTEXT_MESSAGES = int(setting("CONTEXT_MESSAGES", "6"))
 MAX_TEXT = int(setting("MAX_TEXT", "2000"))
 LABEL_DRAFTS = setting("LABEL_DRAFTS", "false") == "true"
-# Judgments allowed per run; the rest wait for the next run. 0 means no limit
+# PRs judged per run, with 0 for no limit
 MAX_JUDGMENTS = int(setting("MAX_JUDGMENTS", "20"))
-# How far back a run looks when nothing says where the last one stopped. 0 means every open PR, oldest first
+# Hours to look back without saved progress, with 0 for every open PR
 LOOKBACK_HOURS = float(setting("LOOKBACK_HOURS", "0"))
 LOG_REASONS = setting("LOG_REASONS", "false") == "true"
 MODEL_TIMEOUT = int(setting("MODEL_TIMEOUT", "300"))
@@ -57,17 +66,20 @@ MODEL_TIMEOUT = int(setting("MODEL_TIMEOUT", "300"))
 EFFORT = setting("EFFORT", "")
 GITHUB_TRIES = int(setting("GITHUB_TRIES", "3"))
 GITHUB_RETRY_DELAY = int(setting("GITHUB_RETRY_DELAY", "10"))
-# How much of each PR's history is fetched. CONTEXT_MESSAGES can only read what these fetch
+# CONTEXT_MESSAGES can only read what these limits fetch
 MAX_COMMENTS = int(setting("MAX_COMMENTS", "30"))
 MAX_REVIEWS = int(setting("MAX_REVIEWS", "20"))
 MAX_REVIEW_COMMENTS = int(setting("MAX_REVIEW_COMMENTS", "20"))
 MAX_COMMITS = int(setting("MAX_COMMITS", "10"))
 MAX_LABEL_EVENTS = int(setting("MAX_LABEL_EVENTS", "30"))
-# Holds the time the last run judged up to
+# A file with the time the last run judged up to
 STATE_FILE = setting("STATE_FILE", "")
+STAMP = "%Y-%m-%dT%H:%M:%SZ"
+# GitHub returns no more than this many results for a search
+SEARCH_LIMIT = 1000
 
 PR_FIELDS = """
-  number title isDraft author { login }
+  number title isDraft updatedAt author { login }
   labels(first: 30) { nodes { name } }
   labeled: timelineItems(last: %(label_events)d, itemTypes: [LABELED_EVENT, UNLABELED_EVENT]) { nodes { __typename
     ... on LabeledEvent { createdAt label { name } } ... on UnlabeledEvent { createdAt label { name } } } }
@@ -138,11 +150,15 @@ def search(q):
 
 
 def is_bot(login):
-    return login is None or login in IGNORED_USERS or login.endswith("[bot]")
+    return login is None or login.lower() in IGNORED_USERS or login.endswith("[bot]")
+
+
+def commit_login(actor):
+    return ((actor or {}).get("user") or {}).get("login")
 
 
 def events(pr):
-    """Author and team activity as (time, login, kind, text), oldest first; bots, /bot commands and others left out."""
+    """Author and team activity as (time, login, kind, text), oldest first; bots, commands and others left out."""
     author = pr["author"]["login"]
     out = []
     for c in pr["comments"]["nodes"]:
@@ -157,18 +173,18 @@ def events(pr):
         out.append((r["submittedAt"], login, r["authorAssociation"], "review " + r["state"], text))
     for c in pr["commits"]["nodes"]:
         c = c["commit"]
-        committer = (c["committer"]["user"] or {}).get("login")
+        committer = commit_login(c["committer"])
         # A web editor commit has committer web-flow; "Update branch" rebases keep the old authored date
-        web_edit = committer == "web-flow" and (c["author"]["user"] or {}).get("login") == author \
+        web_edit = committer == "web-flow" and commit_login(c["author"]) == author \
             and c["authoredDate"] == c["committedDate"]
         if committer == author or web_edit:
             out.append((c["committedDate"], author, "", "commit", ""))
-    return sorted(e for e in out if e[1] == author or e[2] in TEAM or e[1] in TEAM_USERS)
+    return sorted(e for e in out if e[1] == author or e[2] in TEAM or e[1].lower() in TEAM_USERS)
 
 
 def label_changed(pr, types=("LabeledEvent", "UnlabeledEvent")):
     return max((e["createdAt"] for e in pr["labeled"]["nodes"]
-                if e and e["__typename"] in types and e["label"]["name"] == LABEL), default="")
+                if e and e["__typename"] in types and e["label"]["name"].lower() == LABEL.lower()), default="")
 
 
 def decide(pr, labeled, start, end):
@@ -199,6 +215,8 @@ def prompt_for(pr, evs=None):
 
 
 def open_model():
+    if INSTALL:
+        install(PROVIDER, CLAUDE_CODE_VERSION, COPILOT_SDK_VERSION)
     if PROVIDER == "claude":
         return ClaudeModel(MODEL, SYSTEM_PROMPT, SCHEMA, CLAUDE_BIN, MODEL_TIMEOUT, EFFORT)
     return CopilotModel(MODEL or None, SYSTEM_PROMPT, SCHEMA, os.environ.get("WAIT_LABEL_COPILOT_TOKEN"), MODEL_TIMEOUT, EFFORT)
@@ -207,7 +225,7 @@ def open_model():
 def ensure_label():
     path = f"repos/{REPO_OWNER}/{REPO_NAME}/labels"
     try:
-        gh("api", f"{path}/{quote(LABEL)}", tries=1)
+        gh("api", f"{path}/{quote(LABEL, safe='')}", tries=1)
     except RuntimeError as error:
         if "HTTP 404" not in str(error):
             raise
@@ -223,7 +241,7 @@ def set_label(number, add, apply):
         if add:
             gh("api", "-X", "POST", path, "-f", f"labels[]={LABEL}", tries=1)
         else:
-            gh("api", "-X", "DELETE", f"{path}/{quote(LABEL)}", tries=1)
+            gh("api", "-X", "DELETE", f"{path}/{quote(LABEL, safe='')}", tries=1)
     except RuntimeError as error:
         # Someone removed it by hand since the search
         if add or "HTTP 404" not in str(error):
@@ -231,12 +249,15 @@ def set_label(number, add, apply):
 
 
 def collect(start, end, apply, report):
-    """Removes the labels that need no judgment and returns the rest as (activity time, number, labeled, prompt), oldest first."""
-    # Oldest first, since a search stops at 1000 results and each run starts after the last PR judged
+    """Removes the labels that need no judgment and returns the rest, oldest first, with the time they cover up to."""
+    # A search stops at 1000 results, so oldest first lets later runs reach the rest
     open_prs = f"repo:{REPO_OWNER}/{REPO_NAME} is:pr is:open sort:updated-asc" + (f" updated:>={start}" if start else "")
+    found = [(labeled, search(q)) for labeled, q in ((True, f'{open_prs} label:"{LABEL}"'), (False, f'{open_prs} -label:"{LABEL}"'))]
+    # A search that was cut off says nothing about PRs past its last result
+    end = min([end] + [prs[-1]["updatedAt"] for _, prs in found if len(prs) >= SEARCH_LIMIT])
     todo = []
-    for labeled, q in ((True, f'{open_prs} label:"{LABEL}"'), (False, f'{open_prs} -label:"{LABEL}"')):
-        for pr in search(q):
+    for labeled, prs in found:
+        for pr in prs:
             if is_bot((pr["author"] or {}).get("login")):
                 continue
             action = decide(pr, labeled, start, end)
@@ -248,7 +269,7 @@ def collect(start, end, apply, report):
                     print(f"::warning::Cannot remove the label from #{pr['number']}: {error}")
             elif action == "judge":
                 todo.append((events(pr)[-1][0], pr["number"], labeled, prompt_for(pr)))
-    return sorted(todo)
+    return sorted(todo), end
 
 
 def judge(model, prompt, usage):
@@ -268,14 +289,14 @@ def judge_all(todo, model, apply, report):
         try:
             verdict = judge(model, prompt, report["usage"])
             report["judged"] += 1
-            # Off by default: a public Actions log would carry the model's judgment of each named contributor's PR
+            # Off by default because a public Actions log would show the model's judgment of each named contributor's PR
             if LOG_REASONS:
                 print(f"#{number} waiting_on_author={verdict['waiting_on_author']}: {verdict['reason']}")
             if verdict["waiting_on_author"] != labeled:
                 set_label(number, not labeled, apply)
                 report["removed" if labeled else "added"].append(number)
         except Exception as error:
-            # The label stays as it is until the PR's next activity judges it again
+            # The label stays as it is until the PR has new activity
             print(f"::warning::Cannot judge #{number}: {error}")
             report["failures"] += 1
 
@@ -297,6 +318,10 @@ def write_report(report, through):
             out.write("| | |\n|---|---|\n" + "".join(f"| {k} | {v} |\n" for k, v in outputs.items()))
 
 
+def before(time_text):
+    return (datetime.strptime(time_text, STAMP) - timedelta(seconds=1)).strftime(STAMP)
+
+
 def read_state():
     try:
         with open(STATE_FILE, encoding="utf-8") as state:
@@ -312,17 +337,21 @@ def main():
                     help="change labels instead of printing what would change")
     ap.add_argument("--dump-prompts", metavar="FILE", help="write the prompts as JSON lines instead of calling the model")
     args = ap.parse_args()
+    if PROVIDER not in ("copilot", "claude"):
+        sys.exit(f"Unknown provider {PROVIDER}: use copilot or claude")
 
-    stamp = "%Y-%m-%dT%H:%M:%SZ"
-    # A PR is judged once its conversation has been quiet for QUIET_MINUTES, so the window trails the clock by that much
+    # A PR is judged once it has been quiet for QUIET_MINUTES, so the window ends that long ago
     end_time = datetime.now(timezone.utc) - timedelta(minutes=QUIET_MINUTES)
-    end = end_time.strftime(stamp)
-    start = args.since or read_state() or (LOOKBACK_HOURS and (end_time - timedelta(hours=LOOKBACK_HOURS)).strftime(stamp)) or ""
+    end = end_time.strftime(STAMP)
+    saved = read_state()
+    start = args.since or saved or (LOOKBACK_HOURS and (end_time - timedelta(hours=LOOKBACK_HOURS)).strftime(STAMP)) or ""
+    if not args.since and not saved:
+        print(f"No saved progress, so starting from {start or 'the oldest open PR'}")
 
     report = {"added": [], "removed": [], "judged": 0, "held": 0, "failures": 0, "usage": Usage()}
     if args.apply:
         ensure_label()
-    todo = collect(start, end, args.apply, report)
+    todo, end = collect(start, end, args.apply, report)
 
     if args.dump_prompts:
         with open(args.dump_prompts, "w", encoding="utf-8") as dump:
@@ -330,16 +359,18 @@ def main():
                 dump.write(json.dumps({"number": number, "labeled": labeled, "prompt": prompt}) + "\n")
         return
 
-    # What the cap holds back is judged next run, because that run starts from the last PR judged here
+    # What the cap holds back is judged next run, which starts just before the first PR held
     if MAX_JUDGMENTS and len(todo) > MAX_JUDGMENTS:
         report["held"] = len(todo) - MAX_JUDGMENTS
+        resume = before(todo[MAX_JUDGMENTS][0])
         todo = todo[:MAX_JUDGMENTS]
-        end = todo[-1][0]
+        # More PRs in one second than the cap would otherwise never get past that second
+        end = resume if resume > start else todo[-1][0]
     if todo:
         with open_model() as model:
             judge_all(todo, model, args.apply, report)
     write_report(report, end)
-    # Every call failing means the token or the model is broken, not one PR
+    # Every call failing means the token or the model is broken
     if todo and report["failures"] == len(todo):
         sys.exit("Every judgment failed")
     if STATE_FILE:

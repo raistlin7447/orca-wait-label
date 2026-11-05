@@ -57,6 +57,17 @@ class Events(unittest.TestCase):
         p = pr(commits=[commit("2026-01-02T00:00:00Z", committer="web-flow", author="reviewer")])
         self.assertEqual(self.logins(p), [])
 
+    def test_commits_with_no_author_or_committer_are_skipped(self):
+        c = commit("2026-01-02T00:00:00Z")
+        c["commit"]["committer"] = c["commit"]["author"] = None
+        self.assertEqual(self.logins(pr(commits=[c])), [])
+
+    def test_team_users_ignore_case(self):
+        self.assertEqual(self.logins(pr([comment("TRIAGER", "2026-01-02T00:00:00Z")])), ["TRIAGER"])
+
+    def test_ignored_users_ignore_case(self):
+        self.assertEqual(self.logins(pr([comment("CODERABBITAI", "2026-01-02T00:00:00Z", association="MEMBER")])), [])
+
     def test_review_comments_join_the_review_text(self):
         review = {"author": {"login": "reviewer"}, "authorAssociation": "MEMBER", "state": "COMMENTED",
                   "submittedAt": "2026-01-02T00:00:00Z", "bodyText": "", "comments": {"nodes": [{"path": "a.c", "bodyText": "Why?"}]}}
@@ -83,6 +94,11 @@ class Decide(unittest.TestCase):
 
     def test_label_change_after_the_activity_settles_it(self):
         p = pr([ASK], labeled=[("UnlabeledEvent", "2026-01-02T01:00:00Z")])
+        self.assertIsNone(w.decide(p, False, START, END))
+
+    def test_label_events_ignore_case(self):
+        p = pr([ASK], labeled=[("UnlabeledEvent", "2026-01-02T01:00:00Z")])
+        p["labeled"]["nodes"][0]["label"]["name"] = w.LABEL.upper()
         self.assertIsNone(w.decide(p, False, START, END))
 
     def test_author_commit_after_the_label_removes_it(self):
@@ -177,10 +193,28 @@ class Search(unittest.TestCase):
     def test_later_runs_start_after_the_last_one(self):
         self.assertTrue(all(f"updated:>={START}" in q for q in self.queries(START)))
 
+    def test_a_cut_off_search_stops_at_its_last_result(self):
+        cut_off = [pr([ASK], number=i) | {"updatedAt": "2026-01-02T12:00:00Z"} for i in range(3)]
+        with mock.patch.object(w, "search", side_effect=[[], cut_off]), mock.patch.object(w, "SEARCH_LIMIT", 3):
+            _, end = w.collect(START, END, False, fresh_report())
+        self.assertEqual(end, "2026-01-02T12:00:00Z")
+
+    def test_a_complete_search_keeps_the_end(self):
+        with mock.patch.object(w, "search", return_value=[pr([ASK]) | {"updatedAt": "2026-01-02T12:00:00Z"}]):
+            todo, end = w.collect(START, END, False, fresh_report())
+        self.assertEqual((len(todo), end), (2, END))
+
+
+class Labels(unittest.TestCase):
+    def test_slashes_in_a_label_are_escaped(self):
+        with mock.patch.object(w, "LABEL", "status/waiting on author"), mock.patch.object(w, "gh") as gh:
+            w.set_label(1, False, True)
+        self.assertTrue(gh.call_args.args[-1].endswith("/labels/status%2Fwaiting%20on%20author"))
+
 
 class Run(unittest.TestCase):
     def run_main(self, todo, argv=(), state=None, model=None):
-        """Runs main() with GitHub and the model faked; returns the state file's contents and the window passed to collect."""
+        """Runs main() with GitHub and the model faked, and returns the saved state and the window passed to collect."""
         folder = tempfile.mkdtemp()
         path = os.path.join(folder, "state", "state.json")
         if state:
@@ -190,7 +224,7 @@ class Run(unittest.TestCase):
         fake = mock.MagicMock()
         fake.__enter__.return_value = model or FakeModel(*[False] * 10)
         with mock.patch.object(w, "STATE_FILE", path), mock.patch.object(w, "MAX_JUDGMENTS", 2), \
-                mock.patch.object(w, "collect", return_value=todo) as collect, mock.patch.object(w, "ensure_label"), \
+                mock.patch.object(w, "collect", side_effect=lambda s, e, a, r: (todo, e)) as collect, mock.patch.object(w, "ensure_label"), \
                 mock.patch.object(w, "open_model", return_value=fake) as open_model, \
                 mock.patch.object(w, "set_label"), mock.patch.object(sys, "argv", ["wait_label.py", *argv]):
             w.main()
@@ -226,7 +260,29 @@ class Run(unittest.TestCase):
     def test_the_cap_holds_prs_for_the_next_run(self):
         times = [f"2026-01-0{day}T00:00:00Z" for day in (1, 2, 3)]
         saved, _ = self.run_main([(t, i, False, "p") for i, t in enumerate(times)], ["--apply"])
-        self.assertEqual(saved, times[1])
+        self.assertEqual(saved, "2026-01-02T23:59:59Z")
+
+    def test_the_cap_does_not_skip_a_pr_in_the_same_second(self):
+        times = ["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z"]
+        saved, _ = self.run_main([(t, i, False, "p") for i, t in enumerate(times)], ["--apply"])
+        self.assertEqual(saved, "2026-01-01T23:59:59Z")
+
+    def test_more_prs_in_one_second_than_the_cap_still_moves_on(self):
+        time = "2026-01-02T00:00:00Z"
+        saved, _ = self.run_main([(time, i, False, "p") for i in range(3)], ["--apply"], state="2026-01-01T23:59:59Z")
+        self.assertEqual(saved, time)
+
+    def test_an_unknown_provider_stops_the_run(self):
+        with mock.patch.object(w, "PROVIDER", "Claude"), self.assertRaises(SystemExit) as stopped:
+            self.run_main([], ["--apply"])
+        self.assertIn("Unknown provider", str(stopped.exception))
+
+    def test_tools_are_installed_only_on_opening_a_model(self):
+        with mock.patch.object(w, "INSTALL", True), mock.patch.object(w, "install") as install:
+            self.run_main([], ["--apply"])
+            install.assert_not_called()
+            w.open_model()
+            install.assert_called_once()
 
     def test_no_model_is_opened_with_nothing_to_judge(self):
         self.run_main([], ["--apply"])
@@ -262,6 +318,19 @@ class Providers(unittest.TestCase):
         for limit in (f"comments(last: {w.MAX_COMMENTS})", f"commits(last: {w.MAX_COMMITS})",
                       f"reviews(last: {w.MAX_REVIEWS})", f"timelineItems(last: {w.MAX_LABEL_EVENTS},"):
             self.assertIn(limit, w.QUERY)
+
+    def test_claude_failure_reports_its_stderr(self):
+        with mock.patch("subprocess.run", return_value=mock.Mock(stdout="", stderr="Invalid token\n", returncode=1)):
+            with self.assertRaisesRegex(RuntimeError, "Invalid token"):
+                models.ClaudeModel("m", "s", {}).judge("p")
+
+    def test_install_uses_the_provider_and_version(self):
+        with mock.patch("subprocess.run") as run:
+            models.install("claude", "1.2.3", "4.5.6")
+        self.assertIn("@anthropic-ai/claude-code@1.2.3", run.call_args.args[0])
+        with mock.patch("subprocess.run") as run, mock.patch.object(sys, "path", list(sys.path)):
+            models.install("copilot", "1.2.3", "4.5.6")
+        self.assertIn("github-copilot-sdk==4.5.6", run.call_args.args[0])
 
     def test_claude_errors_raise(self):
         with mock.patch("subprocess.run", return_value=mock.Mock(stdout=json.dumps({"is_error": True, "result": "no"}))):

@@ -146,29 +146,12 @@ outputs:
 runs:
   using: composite
   steps:
-    # The state file says where the last run stopped. Dry runs keep their own, so a real run starts from the beginning
+    # The key includes dry-run so that a dry run's progress never makes a real run skip PRs
     - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ runner.temp }}/wait-label-state
         key: wait-label-${{ inputs.repository }}-${{ inputs.label }}-${{ inputs.dry-run }}-${{ github.run_id }}-${{ github.run_attempt }}
         restore-keys: wait-label-${{ inputs.repository }}-${{ inputs.label }}-${{ inputs.dry-run }}-
-
-    - name: Install Claude Code
-      if: inputs.provider == 'claude'
-      shell: bash
-      env:
-        VERSION: ${{ inputs.claude-code-version }}
-      run: npm install -g "@anthropic-ai/claude-code@$VERSION"
-
-    - name: Install the Copilot SDK
-      if: inputs.provider == 'copilot'
-      shell: bash
-      env:
-        VERSION: ${{ inputs.copilot-sdk-version }}
-      run: |
-        python3 -m venv "$RUNNER_TEMP/wait-label-venv"
-        "$RUNNER_TEMP/wait-label-venv/bin/pip" install --quiet "github-copilot-sdk==$VERSION"
-        echo "$RUNNER_TEMP/wait-label-venv/bin" >> "$GITHUB_PATH"
 
     - name: Sweep
       id: sweep
@@ -179,6 +162,9 @@ runs:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
         WAIT_LABEL_COPILOT_TOKEN: ${{ inputs.copilot-token || inputs.github-token }}
         WAIT_LABEL_PROVIDER: ${{ inputs.provider }}
+        WAIT_LABEL_INSTALL: 'true'
+        WAIT_LABEL_CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
+        WAIT_LABEL_COPILOT_SDK_VERSION: ${{ inputs.copilot-sdk-version }}
         WAIT_LABEL_REPO: ${{ inputs.repository }}
         WAIT_LABEL_DRY_RUN: ${{ inputs.dry-run }}
         WAIT_LABEL_SINCE: ${{ inputs.since }}

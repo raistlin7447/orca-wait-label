@@ -35,7 +35,7 @@ jobs:
           repository: OrcaSlicer/OrcaSlicer
           label: wait for response
           command-prefix: /bot
-          # The labels are already up to date, so there is nothing to work through on the first run
+          # Without saved progress, look back 2 hours so that a lost cache doesn't re-judge every open PR
           lookback-hours: 2
           # Scheduled runs change labels only once the repository variable WAIT_LABEL_APPLY is true
           dry-run: ${{ !((github.event_name == 'schedule' && vars.WAIT_LABEL_APPLY == 'true') || inputs.apply) }}

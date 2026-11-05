@@ -115,7 +115,9 @@ jobs:
 
 The first runs work through every open PR, oldest first, 20 PRs at a time, and later runs only look at new activity. The `held` count in the log shows how many are left. An hourly schedule gets through about 480 PRs a day, and you can raise `max-judgments` or run the workflow by hand to go faster. Dry runs and real runs keep separate progress, so the first real run starts again from the oldest PR.
 
-The Action needs a Linux or macOS runner with `gh` and `python3`, version 3.11 or newer for Copilot. `ubuntu-latest` has them.
+Progress is saved in the Actions cache, and GitHub removes a cache that goes unused for 7 days. A run with no saved progress works through every open PR again, which spends credits again. Set `lookback-hours` to limit how far back it goes.
+
+The Action needs a Linux or macOS runner with `gh`, plus `python3` and `pip` for Copilot (Python 3.11 or newer) or `npm` for Claude. `ubuntu-latest` has them all.
 
 To stop the code that handles your token from changing, pin the Action to a commit SHA instead of `@v1`.
 

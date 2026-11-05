@@ -4,8 +4,7 @@
 Same system prompt, schema and cases as run_model.py, one fresh session per case, no tools. Needs
 `pip install github-copilot-sdk`. Reads the token from the file named by WAIT_LABEL_COPILOT_TOKEN_FILE and
 passes it only to the Copilot client. Writes data/runs/<label>_run<N>.jsonl and skips cases already written,
-so an interrupted run resumes. Without --model, Copilot picks the model, as it must on the Free plan.
-With --models it only prints the models the token can use, and makes no model call.
+so an interrupted run resumes.
 """
 import argparse
 import asyncio

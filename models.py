@@ -1,8 +1,9 @@
-"""The two ways to ask a model the bot's question. Both answer with one JSON object and have no tools."""
+"""The model providers, which answer the bot's question with one JSON object and have no tools."""
 import asyncio
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 
@@ -14,7 +15,6 @@ class Usage:
     output_tokens: int = 0
     # Claude reports dollars at list price, which is only an estimate on a subscription token
     cost_usd: float = 0.0
-    # Copilot reports AI credits
     ai_credits: float = 0.0
 
     def add(self, other):
@@ -23,9 +23,19 @@ class Usage:
 
 
 def model_env():
-    """The environment for a model process, which has no use for the GitHub token that changes labels."""
+    """The environment for a model process, with the GitHub tokens removed."""
     hidden = {"GH_TOKEN", "GITHUB_TOKEN", "WAIT_LABEL_COPILOT_TOKEN"}
     return {k: v for k, v in os.environ.items() if v and k not in hidden}
+
+
+def install(provider, claude_version, copilot_version):
+    if provider == "claude":
+        subprocess.run(["npm", "install", "-g", f"@anthropic-ai/claude-code@{claude_version}"], check=True)
+    else:
+        target = tempfile.mkdtemp()
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--target", target,
+                        f"github-copilot-sdk=={copilot_version}"], check=True)
+        sys.path.insert(0, target)
 
 
 class ClaudeModel:
@@ -44,7 +54,10 @@ class ClaudeModel:
     def judge(self, prompt):
         out = subprocess.run(self.args, input=prompt, capture_output=True, text=True, encoding="utf-8",
                              timeout=self.timeout, env=model_env())
-        result = json.loads(out.stdout)
+        try:
+            result = json.loads(out.stdout)
+        except ValueError:
+            raise RuntimeError((out.stderr or out.stdout or f"claude exited with {out.returncode}").strip()[:500])
         if result.get("is_error"):
             raise RuntimeError(result.get("result"))
         usage = result.get("usage", {})
