@@ -34,6 +34,7 @@ concurrency:
 jobs:
   sweep:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: raistlin7447/waiting-on-author@v1
         with:
@@ -67,6 +68,7 @@ concurrency:
 jobs:
   sweep:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: raistlin7447/waiting-on-author@v1
         with:
@@ -99,6 +101,7 @@ concurrency:
 jobs:
   sweep:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: raistlin7447/waiting-on-author@v1
         with:
@@ -113,11 +116,11 @@ jobs:
 1. Run the workflow from the Actions tab and read the log. With `dry-run: true`, it only logs what it would change.
 2. Change `dry-run` to `false` when the log looks right.
 
-The first runs work through every open PR, oldest first, 20 PRs at a time, and later runs only look at new activity. The `held` count in the log shows how many are left. An hourly schedule gets through about 480 PRs a day, and you can raise `max-judgments` or run the workflow by hand to go faster. Dry runs and real runs keep separate progress, so the first real run starts again from the oldest PR.
+The first runs work through every open PR, oldest first, 20 PRs at a time, and later runs only look at new activity. The `held` count in the log shows how many are left. An hourly schedule gets through about 480 PRs a day, and you can run the workflow by hand or raise `max-judgments` to go faster. Raise `timeout-minutes` along with it. Dry runs and real runs keep separate progress, so the first real run starts again from the oldest PR.
 
 Progress is saved in the Actions cache, and GitHub removes a cache that goes unused for 7 days. A run with no saved progress works through every open PR again, which spends credits again. Set `lookback-hours` to limit how far back it goes.
 
-The Action needs a Linux or macOS runner with `gh`, plus `python3` and `pip` for Copilot (Python 3.11 or newer) or `npm` for Claude. `ubuntu-latest` has them all.
+The Action needs a Linux or macOS runner with `gh`, plus `python3` and `pip` for Copilot (Python 3.11 or newer) or `npm` for Claude. `ubuntu-latest` has them all. It hasn't been tested on GitHub Enterprise Server.
 
 To stop the code that handles your token from changing, pin the Action to a commit SHA instead of `@v1`.
 
@@ -211,9 +214,7 @@ To close PRs that never get a reply, point [`actions/stale`](https://github.com/
 
 ## Reliability
 
-`eval/` builds cases from the history of open PRs, runs a model on them with the same call the Action makes, and scores the result against reference judgments. The cases and judgments aren't in this repository, because they're about named contributors' PRs.
-
-We compared Sonnet 5.5 with reference judgments on 200 cases from one repository, with three calls required to agree. It said "waiting" on 3 cases where the reference did not, and missed 1 of 76 clear waits. The Claude CLI and the Copilot SDK scored the same. No Free plan account has been tested, so start with a dry run on your repository.
+We built 200 cases from the history of open PRs in one repository, and compared Sonnet 5.5 with reference judgments, using the same call the Action makes and requiring three calls to agree. It said "waiting" on 3 cases where the reference did not, and missed 1 of 76 clear waits. The Claude CLI and the Copilot SDK scored the same. The cases and judgments aren't published, because they're about named contributors' PRs. No Free plan account has been tested, so start with a dry run on your repository.
 
 ## Running locally
 

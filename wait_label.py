@@ -126,6 +126,11 @@ SCHEMA = {
 }
 
 
+def one_line(text):
+    """Text for the log, where a line starting with :: would be a workflow command."""
+    return " ".join(str(text).split())
+
+
 def gh(*args, tries=GITHUB_TRIES):
     # GitHub answers a search with this many nested fields with an occasional 502
     for attempt in range(tries):
@@ -266,7 +271,7 @@ def collect(start, end, apply, report):
                     set_label(pr["number"], False, apply)
                     report["removed"].append(pr["number"])
                 except RuntimeError as error:
-                    print(f"::warning::Cannot remove the label from #{pr['number']}: {error}")
+                    print(f"::warning::Cannot remove the label from #{pr['number']}: {one_line(error)}")
             elif action == "judge":
                 todo.append((events(pr)[-1][0], pr["number"], labeled, prompt_for(pr)))
     return sorted(todo), end
@@ -291,13 +296,13 @@ def judge_all(todo, model, apply, report):
             report["judged"] += 1
             # Off by default because a public Actions log would show the model's judgment of each named contributor's PR
             if LOG_REASONS:
-                print(f"#{number} waiting_on_author={verdict['waiting_on_author']}: {verdict['reason']}")
+                print(f"#{number} waiting_on_author={verdict['waiting_on_author']}: {one_line(verdict['reason'])}")
             if verdict["waiting_on_author"] != labeled:
                 set_label(number, not labeled, apply)
                 report["removed" if labeled else "added"].append(number)
         except Exception as error:
             # The label stays as it is until the PR has new activity
-            print(f"::warning::Cannot judge #{number}: {error}")
+            print(f"::warning::Cannot judge #{number}: {one_line(error)}")
             report["failures"] += 1
 
 

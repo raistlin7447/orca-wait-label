@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import sys
@@ -180,6 +182,18 @@ class Judging(unittest.TestCase):
             w.judge_all([("t", 1, False, "bad"), ("t", 2, False, "p")], Flaky(False), True, report)
         self.assertEqual((report["failures"], report["judged"]), (1, 1))
 
+    def test_logged_model_text_stays_on_one_line(self):
+        class Injecting(FakeModel):
+            def judge(self, prompt):
+                if prompt == "bad":
+                    raise RuntimeError("boom\n::error::fake")
+                return {"waiting_on_author": False, "reason": "fine\n::error::fake"}, models.Usage()
+        out = io.StringIO()
+        with mock.patch.object(w, "LOG_REASONS", True), contextlib.redirect_stdout(out):
+            w.judge_all([("t", 1, False, "p"), ("t", 2, False, "bad")], Injecting(), False, fresh_report())
+        self.assertEqual(len(out.getvalue().splitlines()), 2)
+        self.assertFalse(any(line.startswith("::error") for line in out.getvalue().splitlines()))
+
 
 class Search(unittest.TestCase):
     def queries(self, start):
@@ -331,6 +345,20 @@ class Providers(unittest.TestCase):
         with mock.patch("subprocess.run") as run, mock.patch.object(sys, "path", list(sys.path)):
             models.install("copilot", "1.2.3", "4.5.6")
         self.assertIn("github-copilot-sdk==4.5.6", run.call_args.args[0])
+
+    def test_installs_see_no_tokens(self):
+        env = {"GH_TOKEN": "a", "GITHUB_TOKEN": "b", "WAIT_LABEL_COPILOT_TOKEN": "c",
+               "CLAUDE_CODE_OAUTH_TOKEN": "d", "ANTHROPIC_API_KEY": "e", "PATH": "p"}
+        for provider in ("claude", "copilot"):
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch("subprocess.run") as run, \
+                    mock.patch.object(sys, "path", list(sys.path)), mock.patch("tempfile.mkdtemp", return_value="t"):
+                models.install(provider, "1.2.3", "4.5.6")
+            self.assertEqual(run.call_args.kwargs["env"], {"PATH": "p"})
+
+    def test_copilot_installs_from_wheels_only(self):
+        with mock.patch("subprocess.run") as run, mock.patch.object(sys, "path", list(sys.path)):
+            models.install("copilot", "1.2.3", "4.5.6")
+        self.assertIn(":all:", run.call_args.args[0])
 
     def test_claude_errors_raise(self):
         with mock.patch("subprocess.run", return_value=mock.Mock(stdout=json.dumps({"is_error": True, "result": "no"}))):

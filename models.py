@@ -22,19 +22,28 @@ class Usage:
             setattr(self, field, getattr(self, field) + getattr(other, field))
 
 
+GITHUB_TOKENS = {"GH_TOKEN", "GITHUB_TOKEN", "WAIT_LABEL_COPILOT_TOKEN"}
+MODEL_TOKENS = {"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}
+
+
+def env_without(tokens):
+    return {k: v for k, v in os.environ.items() if v and k not in tokens}
+
+
 def model_env():
     """The environment for a model process, with the GitHub tokens removed."""
-    hidden = {"GH_TOKEN", "GITHUB_TOKEN", "WAIT_LABEL_COPILOT_TOKEN"}
-    return {k: v for k, v in os.environ.items() if v and k not in hidden}
+    return env_without(GITHUB_TOKENS)
 
 
 def install(provider, claude_version, copilot_version):
+    # Packages run their own scripts while installing, so they get no tokens
+    env = env_without(GITHUB_TOKENS | MODEL_TOKENS)
     if provider == "claude":
-        subprocess.run(["npm", "install", "-g", f"@anthropic-ai/claude-code@{claude_version}"], check=True)
+        subprocess.run(["npm", "install", "-g", f"@anthropic-ai/claude-code@{claude_version}"], check=True, env=env)
     else:
         target = tempfile.mkdtemp()
-        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--target", target,
-                        f"github-copilot-sdk=={copilot_version}"], check=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--only-binary", ":all:", "--target", target,
+                        f"github-copilot-sdk=={copilot_version}"], check=True, env=env)
         sys.path.insert(0, target)
 
 

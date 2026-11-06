@@ -33,7 +33,9 @@ jobs:
     # Scheduled runs take a minute or two; a manual catch-up over days of activity takes longer
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./
         with:
           provider: ${{ inputs.provider || 'claude' }}
