@@ -8,13 +8,7 @@ The Action runs on your own runner with your own tokens. It never runs PR code, 
 
 ## Quick start
 
-First create the label, on your repository's Labels page or with this command:
-
-```bash
-gh label create "waiting on author" --color fbca04
-```
-
-Then pick the setup that fits, add the workflow as `.github/workflows/waiting-on-author.yml`, and follow [After setup](#after-setup).
+Pick the setup that fits, add the workflow as `.github/workflows/waiting-on-author.yml`, then follow [After setup](#after-setup).
 
 ### Copilot in a personal repository
 
@@ -154,7 +148,7 @@ Each run looks at open PRs with new activity from the PR author or a team member
 | `dry-run` | `true` | Only log what would change |
 | `since` | | Judge activity after this ISO time, instead of where the last run stopped |
 | `lookback-hours` | `0` | How far back to look when no earlier run says where it stopped. `0` means every open PR, oldest first |
-| `label` | `waiting on author` | The label's name. Create it first, or give a real run the `issues: write` permission to create it |
+| `label` | `waiting on author` | The label's name. It is created if it is missing |
 | `label-color` | `fbca04` | The color for a label this Action creates |
 | `label-drafts` | `false` | Whether the label can be added to draft PRs |
 | `team-associations` | `OWNER,MEMBER,COLLABORATOR` | Who counts as the team, by GitHub's author association. Empty leaves only `team-users` |

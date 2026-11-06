@@ -286,22 +286,17 @@ class EnsureLabel(unittest.TestCase):
                 w.ensure_label(apply)
             self.assertEqual(gh.call_count, 1)
 
-    def test_a_dry_run_stops_on_a_missing_label_without_creating_it(self):
-        with mock.patch.object(w, "gh", side_effect=RuntimeError("HTTP 404")) as gh, self.assertRaises(SystemExit) as stopped:
+    def test_a_dry_run_reports_a_missing_label_without_creating_it(self):
+        out = io.StringIO()
+        with mock.patch.object(w, "gh", side_effect=RuntimeError("HTTP 404")) as gh, contextlib.redirect_stdout(out):
             w.ensure_label(False)
-        self.assertIn("doesn't exist", str(stopped.exception))
+        self.assertIn("doesn't exist", out.getvalue())
         self.assertEqual(gh.call_count, 1)
 
     def test_a_real_run_creates_a_missing_label(self):
         with mock.patch.object(w, "gh", side_effect=[RuntimeError("HTTP 404"), "{}"]) as gh:
             w.ensure_label(True)
         self.assertIn("POST", gh.call_args.args)
-
-    def test_a_real_run_without_permission_explains_itself(self):
-        with mock.patch.object(w, "gh", side_effect=[RuntimeError("HTTP 404"), RuntimeError("HTTP 403")]), \
-                self.assertRaises(SystemExit) as stopped:
-            w.ensure_label(True)
-        self.assertIn("issues: write", str(stopped.exception))
 
     def test_other_errors_still_raise(self):
         with mock.patch.object(w, "gh", side_effect=RuntimeError("HTTP 500")), self.assertRaises(RuntimeError):

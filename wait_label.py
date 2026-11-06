@@ -236,19 +236,13 @@ def ensure_label(apply):
     path = f"repos/{REPO_OWNER}/{REPO_NAME}/labels"
     try:
         gh("api", f"{path}/{quote(LABEL, safe='')}", tries=1)
-        return
     except RuntimeError as error:
         if "HTTP 404" not in str(error):
             raise
-    missing = f"Label '{LABEL}' doesn't exist. Create it, or let a real run create it with the issues: write permission"
-    if not apply:
-        sys.exit(missing)
-    try:
-        gh("api", "-X", "POST", path, "-f", f"name={LABEL}", "-f", f"color={LABEL_COLOR}", tries=1)
-    except RuntimeError as error:
-        if "HTTP 403" not in str(error):
-            raise
-        sys.exit(missing)
+        if apply:
+            gh("api", "-X", "POST", path, "-f", f"name={LABEL}", "-f", f"color={LABEL_COLOR}", tries=1)
+        else:
+            print(f"Label '{LABEL}' doesn't exist, so a real run will create it")
 
 
 def set_label(number, add, apply):
