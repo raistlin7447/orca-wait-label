@@ -33,7 +33,7 @@ inputs:
     description: How far back to look when no earlier run says where it stopped. 0 means every open PR, oldest first
     default: '0'
   label:
-    description: The label's name. It is created if it is missing
+    description: The label's name. Create it first, or give a real run the issues write permission to create it
     default: waiting on author
   label-color:
     description: The color for a label this action creates

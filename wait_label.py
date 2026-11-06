@@ -232,14 +232,23 @@ def open_model():
     return CopilotModel(MODEL or None, SYSTEM_PROMPT, SCHEMA, os.environ.get("WAIT_LABEL_COPILOT_TOKEN"), MODEL_TIMEOUT, EFFORT)
 
 
-def ensure_label():
+def ensure_label(apply):
     path = f"repos/{REPO_OWNER}/{REPO_NAME}/labels"
     try:
         gh("api", f"{path}/{quote(LABEL, safe='')}", tries=1)
+        return
     except RuntimeError as error:
         if "HTTP 404" not in str(error):
             raise
+    missing = f"Label '{LABEL}' doesn't exist. Create it, or let a real run create it with the issues: write permission"
+    if not apply:
+        sys.exit(missing)
+    try:
         gh("api", "-X", "POST", path, "-f", f"name={LABEL}", "-f", f"color={LABEL_COLOR}", tries=1)
+    except RuntimeError as error:
+        if "HTTP 403" not in str(error):
+            raise
+        sys.exit(missing)
 
 
 def set_label(number, add, apply):
@@ -381,8 +390,7 @@ def main():
         print(f"No saved progress, so starting from {start or 'the oldest open PR'}")
 
     report = {"added": [], "removed": [], "judged": 0, "held": 0, "failures": 0, "failed_at": [], "usage": Usage()}
-    if args.apply:
-        ensure_label()
+    ensure_label(args.apply)
     todo, end = collect(start, end, args.apply, report)
 
     if args.dump_prompts:

@@ -279,6 +279,35 @@ class Labels(unittest.TestCase):
         self.assertTrue(gh.call_args.args[-1].endswith("/labels/status%2Fwaiting%20on%20author"))
 
 
+class EnsureLabel(unittest.TestCase):
+    def test_an_existing_label_needs_nothing_more(self):
+        for apply in (True, False):
+            with mock.patch.object(w, "gh") as gh:
+                w.ensure_label(apply)
+            self.assertEqual(gh.call_count, 1)
+
+    def test_a_dry_run_stops_on_a_missing_label_without_creating_it(self):
+        with mock.patch.object(w, "gh", side_effect=RuntimeError("HTTP 404")) as gh, self.assertRaises(SystemExit) as stopped:
+            w.ensure_label(False)
+        self.assertIn("doesn't exist", str(stopped.exception))
+        self.assertEqual(gh.call_count, 1)
+
+    def test_a_real_run_creates_a_missing_label(self):
+        with mock.patch.object(w, "gh", side_effect=[RuntimeError("HTTP 404"), "{}"]) as gh:
+            w.ensure_label(True)
+        self.assertIn("POST", gh.call_args.args)
+
+    def test_a_real_run_without_permission_explains_itself(self):
+        with mock.patch.object(w, "gh", side_effect=[RuntimeError("HTTP 404"), RuntimeError("HTTP 403")]), \
+                self.assertRaises(SystemExit) as stopped:
+            w.ensure_label(True)
+        self.assertIn("issues: write", str(stopped.exception))
+
+    def test_other_errors_still_raise(self):
+        with mock.patch.object(w, "gh", side_effect=RuntimeError("HTTP 500")), self.assertRaises(RuntimeError):
+            w.ensure_label(False)
+
+
 class Action(unittest.TestCase):
     def test_the_install_step_has_no_tokens(self):
         path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "action.yml")
