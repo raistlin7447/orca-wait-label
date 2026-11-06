@@ -36,10 +36,11 @@ def model_env():
 
 
 def install(provider, claude_version, copilot_version):
-    # Packages run their own scripts while installing, so they get no tokens
+    # Packages can run their own code while installing, so they get no tokens
     env = env_without(GITHUB_TOKENS | MODEL_TOKENS)
     if provider == "claude":
-        subprocess.run(["npm", "install", "-g", f"@anthropic-ai/claude-code@{claude_version}"], check=True, env=env)
+        subprocess.run(["npm", "install", "-g", "--ignore-scripts", f"@anthropic-ai/claude-code@{claude_version}"],
+                       check=True, env=env)
     else:
         target = tempfile.mkdtemp()
         subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--only-binary", ":all:", "--target", target,
