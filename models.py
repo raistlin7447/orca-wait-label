@@ -39,8 +39,9 @@ def install(provider, claude_version, copilot_version):
     # Packages can run their own code while installing, so they get no tokens
     env = env_without(GITHUB_TOKENS | MODEL_TOKENS)
     if provider == "claude":
-        subprocess.run(["npm", "install", "-g", "--ignore-scripts", f"@anthropic-ai/claude-code@{claude_version}"],
-                       check=True, env=env)
+        # Claude Code's postinstall script puts the real binary in place
+        subprocess.run(["npm", "install", "-g", "--allow-scripts=@anthropic-ai/claude-code",
+                        f"@anthropic-ai/claude-code@{claude_version}"], check=True, env=env)
     else:
         target = tempfile.mkdtemp()
         subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--only-binary", ":all:", "--target", target,

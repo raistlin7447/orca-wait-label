@@ -355,10 +355,10 @@ class Providers(unittest.TestCase):
                 models.install(provider, "1.2.3", "4.5.6")
             self.assertEqual(run.call_args.kwargs["env"], {"PATH": "p"})
 
-    def test_installs_run_no_package_scripts(self):
+    def test_only_claude_code_may_run_install_scripts(self):
         with mock.patch("subprocess.run") as run:
             models.install("claude", "1.2.3", "4.5.6")
-        self.assertIn("--ignore-scripts", run.call_args.args[0])
+        self.assertIn("--allow-scripts=@anthropic-ai/claude-code", run.call_args.args[0])
         with mock.patch("subprocess.run") as run, mock.patch.object(sys, "path", list(sys.path)):
             models.install("copilot", "1.2.3", "4.5.6")
         self.assertIn(":all:", run.call_args.args[0])
