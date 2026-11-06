@@ -1,4 +1,4 @@
-name: Waiting on Author Label
+name: Waiting on Author
 description: Keeps a label on pull requests in step with whether the review is waiting on the PR author
 branding:
   icon: tag

@@ -1,4 +1,4 @@
-# Waiting on Author Label
+# Waiting on Author
 
 A GitHub Action that labels pull requests waiting on their author. Open PRs without the label are your review queue.
 
@@ -35,7 +35,7 @@ jobs:
   sweep:
     runs-on: ubuntu-latest
     steps:
-      - uses: raistlin7447/orca-wait-label@v1
+      - uses: raistlin7447/waiting-on-author@v1
         with:
           copilot-token: ${{ secrets.COPILOT_TOKEN }}
           # Change to false when the log looks right
@@ -68,7 +68,7 @@ jobs:
   sweep:
     runs-on: ubuntu-latest
     steps:
-      - uses: raistlin7447/orca-wait-label@v1
+      - uses: raistlin7447/waiting-on-author@v1
         with:
           # Uses the workflow token, so no token input is needed
           # Change to false when the log looks right
@@ -100,7 +100,7 @@ jobs:
   sweep:
     runs-on: ubuntu-latest
     steps:
-      - uses: raistlin7447/orca-wait-label@v1
+      - uses: raistlin7447/waiting-on-author@v1
         with:
           provider: claude
           claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
