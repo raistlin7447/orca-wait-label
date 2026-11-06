@@ -42,13 +42,13 @@ inputs:
     description: Whether the label can be added to draft PRs
     default: 'false'
   team-associations:
-    description: Who counts as the team, by GitHub's author association
+    description: Who counts as the team, by GitHub's author association. Empty leaves only team-users
     default: OWNER,MEMBER,COLLABORATOR
   team-users:
     description: Comma-separated logins that also count as the team
     default: ''
   ignored-users:
-    description: Accounts whose comments are ignored, besides any [bot] account
+    description: Accounts whose comments are ignored, besides any [bot] account. Empty ignores no others
     default: github-actions,copilot-pull-request-reviewer,Copilot,coderabbitai,dependabot
   command-prefix:
     description: Comments starting with this are commands to another bot, not conversation
@@ -71,6 +71,9 @@ inputs:
   max-judgments:
     description: PRs judged per run, with the rest held for the next run. 0 means no limit
     default: '20'
+  failure-retries:
+    description: How many later runs start again from a failed PR before moving past it
+    default: '3'
   model-timeout:
     description: Seconds to wait for each model call
     default: '300'
@@ -146,12 +149,37 @@ outputs:
 runs:
   using: composite
   steps:
-    # The key includes dry-run so that a dry run's progress never makes a real run skip PRs
+    # The key includes dry-run so that a dry run's progress never makes a real run skip PRs, and the cache rejects commas
+    - name: Name the saved progress
+      id: progress
+      shell: bash
+      env:
+        REPOSITORY: ${{ inputs.repository }}
+        LABEL: ${{ inputs.label }}
+        DRY_RUN: ${{ inputs.dry-run }}
+      run: echo "key=wait-label-$REPOSITORY-${LABEL//,/ }-$DRY_RUN-" >> "$GITHUB_OUTPUT"
+
     - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ runner.temp }}/wait-label-state
-        key: wait-label-${{ inputs.repository }}-${{ inputs.label }}-${{ inputs.dry-run }}-${{ github.run_id }}-${{ github.run_attempt }}
-        restore-keys: wait-label-${{ inputs.repository }}-${{ inputs.label }}-${{ inputs.dry-run }}-
+        key: ${{ steps.progress.outputs.key }}${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: ${{ steps.progress.outputs.key }}
+
+    # Packages can run their own code while installing, so this step gets no tokens
+    - name: Install
+      shell: bash
+      env:
+        PROVIDER: ${{ inputs.provider }}
+        CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
+        COPILOT_SDK_VERSION: ${{ inputs.copilot-sdk-version }}
+        PACKAGES: ${{ runner.temp }}/wait-label-packages
+      run: |
+        if [ "$PROVIDER" = claude ]; then
+          # The claude binary doesn't run unless its postinstall script has
+          npm install -g --allow-scripts=@anthropic-ai/claude-code "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+        elif [ "$PROVIDER" = copilot ]; then
+          python3 -m pip install --quiet --no-warn-conflicts --only-binary :all: --target "$PACKAGES" "github-copilot-sdk==$COPILOT_SDK_VERSION"
+        fi
 
     - name: Sweep
       id: sweep
@@ -161,10 +189,8 @@ runs:
         CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude-code-oauth-token }}
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
         WAIT_LABEL_COPILOT_TOKEN: ${{ inputs.copilot-token || inputs.github-token }}
+        PYTHONPATH: ${{ runner.temp }}/wait-label-packages
         WAIT_LABEL_PROVIDER: ${{ inputs.provider }}
-        WAIT_LABEL_INSTALL: 'true'
-        WAIT_LABEL_CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
-        WAIT_LABEL_COPILOT_SDK_VERSION: ${{ inputs.copilot-sdk-version }}
         WAIT_LABEL_REPO: ${{ inputs.repository }}
         WAIT_LABEL_DRY_RUN: ${{ inputs.dry-run }}
         WAIT_LABEL_SINCE: ${{ inputs.since }}
@@ -182,6 +208,7 @@ runs:
         WAIT_LABEL_CONTEXT_MESSAGES: ${{ inputs.context-messages }}
         WAIT_LABEL_MAX_TEXT: ${{ inputs.max-text }}
         WAIT_LABEL_MAX_JUDGMENTS: ${{ inputs.max-judgments }}
+        WAIT_LABEL_FAILURE_RETRIES: ${{ inputs.failure-retries }}
         WAIT_LABEL_MODEL_TIMEOUT: ${{ inputs.model-timeout }}
         WAIT_LABEL_EFFORT: ${{ inputs.effort }}
         WAIT_LABEL_GITHUB_TRIES: ${{ inputs.github-tries }}
@@ -196,7 +223,9 @@ runs:
         WAIT_LABEL_STATE_FILE: ${{ runner.temp }}/wait-label-state/state.json
       run: python3 "$GITHUB_ACTION_PATH/wait_label.py"
 
+    # A run cut off by its timeout still keeps the progress it made
     - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      if: always()
       with:
         path: ${{ runner.temp }}/wait-label-state
-        key: wait-label-${{ inputs.repository }}-${{ inputs.label }}-${{ inputs.dry-run }}-${{ github.run_id }}-${{ github.run_attempt }}
+        key: ${{ steps.progress.outputs.key }}${{ github.run_id }}-${{ github.run_attempt }}

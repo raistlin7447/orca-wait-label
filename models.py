@@ -3,7 +3,6 @@ import asyncio
 import json
 import os
 import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass
 
@@ -22,31 +21,14 @@ class Usage:
             setattr(self, field, getattr(self, field) + getattr(other, field))
 
 
-GITHUB_TOKENS = {"GH_TOKEN", "GITHUB_TOKEN", "WAIT_LABEL_COPILOT_TOKEN"}
-MODEL_TOKENS = {"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}
+CLAUDE_TOKENS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
+SECRET_WORDS = ("TOKEN", "SECRET", "PASSWORD", "KEY")
 
 
-def env_without(tokens):
-    return {k: v for k, v in os.environ.items() if v and k not in tokens}
-
-
-def model_env():
-    """The environment for a model process, with the GitHub tokens removed."""
-    return env_without(GITHUB_TOKENS)
-
-
-def install(provider, claude_version, copilot_version):
-    # Packages can run their own code while installing, so they get no tokens
-    env = env_without(GITHUB_TOKENS | MODEL_TOKENS)
-    if provider == "claude":
-        # Claude Code's postinstall script puts the real binary in place
-        subprocess.run(["npm", "install", "-g", "--allow-scripts=@anthropic-ai/claude-code",
-                        f"@anthropic-ai/claude-code@{claude_version}"], check=True, env=env)
-    else:
-        target = tempfile.mkdtemp()
-        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--only-binary", ":all:", "--target", target,
-                        f"github-copilot-sdk=={copilot_version}"], check=True, env=env)
-        sys.path.insert(0, target)
+def model_env(keep=()):
+    """The environment for a model process, with every likely secret removed except those named in keep."""
+    return {k: v for k, v in os.environ.items()
+            if v and (k in keep or not any(word in k.upper() for word in SECRET_WORDS))}
 
 
 class ClaudeModel:
@@ -63,8 +45,12 @@ class ClaudeModel:
         pass
 
     def judge(self, prompt):
-        out = subprocess.run(self.args, input=prompt, capture_output=True, text=True, encoding="utf-8",
-                             timeout=self.timeout, env=model_env())
+        try:
+            out = subprocess.run(self.args, input=prompt, capture_output=True, text=True, encoding="utf-8",
+                                 timeout=self.timeout, env=model_env(CLAUDE_TOKENS))
+        except subprocess.TimeoutExpired:
+            # The default message quotes the whole command, with the system prompt, in the log
+            raise RuntimeError(f"claude gave no answer in {self.timeout} seconds") from None
         try:
             result = json.loads(out.stdout)
         except ValueError:
@@ -81,7 +67,7 @@ class CopilotModel:
     def __init__(self, model, system_prompt, schema, token, timeout=300, effort=""):
         self.model, self.system_prompt, self.token = model, system_prompt, token
         self.timeout, self.effort = timeout, effort or None
-        # OpenAI's strict structured output needs a closed object
+        # The Copilot SDK's structured output needs a closed object
         self.schema = {**schema, "additionalProperties": False}
 
     def __enter__(self):

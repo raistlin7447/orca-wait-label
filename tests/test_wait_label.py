@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -59,9 +60,15 @@ class Events(unittest.TestCase):
         p = pr(commits=[commit("2026-01-02T00:00:00Z", committer="web-flow", author="reviewer")])
         self.assertEqual(self.logins(p), [])
 
-    def test_commits_with_no_author_or_committer_are_skipped(self):
-        c = commit("2026-01-02T00:00:00Z")
-        c["commit"]["committer"] = c["commit"]["author"] = None
+    def test_a_commit_linked_to_no_account_counts_as_the_author(self):
+        for empty in (None, {"user": None}):
+            c = commit("2026-01-02T00:00:00Z")
+            c["commit"]["committer"] = c["commit"]["author"] = empty
+            self.assertEqual(self.logins(pr(commits=[c])), ["author"])
+
+    def test_an_unlinked_committer_of_a_team_members_commit_is_not_the_author(self):
+        c = commit("2026-01-02T00:00:00Z", author="reviewer")
+        c["commit"]["committer"] = None
         self.assertEqual(self.logins(pr(commits=[c])), [])
 
     def test_team_users_ignore_case(self):
@@ -107,6 +114,18 @@ class Decide(unittest.TestCase):
         p = pr([ASK], commits=[commit("2026-01-02T02:00:00Z")], labeled=[("LabeledEvent", "2026-01-02T01:00:00Z")])
         self.assertEqual(w.decide(p, True, START, END), "remove")
 
+    def test_a_commit_dated_before_the_window_still_removes_the_label(self):
+        p = pr([ASK], commits=[commit("2026-01-02T02:00:00Z")], labeled=[("LabeledEvent", "2026-01-02T01:00:00Z")])
+        self.assertEqual(w.decide(p, True, "2026-01-02T12:00:00Z", END), "remove")
+
+    def test_a_label_added_after_the_commit_stays(self):
+        p = pr([ASK], commits=[commit("2026-01-02T02:00:00Z")], labeled=[("LabeledEvent", "2026-01-02T03:00:00Z")])
+        self.assertIsNone(w.decide(p, True, "2026-01-02T12:00:00Z", END))
+
+    def test_a_label_event_lost_from_the_history_is_judged_not_removed(self):
+        p = pr([ASK], commits=[commit("2026-01-02T02:00:00Z")])
+        self.assertEqual(w.decide(p, True, START, END), "judge")
+
     def test_author_comment_after_the_label_is_judged(self):
         p = pr([ASK, comment("author", "2026-01-02T02:00:00Z")], labeled=[("LabeledEvent", "2026-01-02T01:00:00Z")])
         self.assertEqual(w.decide(p, True, START, END), "judge")
@@ -131,6 +150,10 @@ class Prompt(unittest.TestCase):
         self.assertIn("x" * w.MAX_TEXT, prompt)
         self.assertNotIn("x" * (w.MAX_TEXT + 1), prompt)
 
+    def test_zero_context_messages_sends_none(self):
+        with mock.patch.object(w, "CONTEXT_MESSAGES", 0):
+            self.assertNotIn("Please rebase", w.prompt_for(pr([ASK])))
+
 
 class FakeModel:
     def __init__(self, *answers):
@@ -143,7 +166,7 @@ class FakeModel:
 
 
 def fresh_report():
-    return {"added": [], "removed": [], "judged": 0, "held": 0, "failures": 0, "usage": models.Usage()}
+    return {"added": [], "removed": [], "judged": 0, "held": 0, "failures": 0, "failed_at": [], "usage": models.Usage()}
 
 
 class Judging(unittest.TestCase):
@@ -219,6 +242,36 @@ class Search(unittest.TestCase):
         self.assertEqual((len(todo), end), (2, END))
 
 
+    def test_a_failed_removal_is_recorded_for_a_retry(self):
+        p = pr([ASK], commits=[commit("2026-01-02T02:00:00Z")], labeled=[("LabeledEvent", "2026-01-02T01:00:00Z")])
+        report = fresh_report()
+        with mock.patch.object(w, "search", side_effect=[[p], []]), mock.patch.object(w, "set_label", side_effect=RuntimeError("no")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            w.collect(START, END, True, report)
+        self.assertEqual((report["removed"], report["failed_at"]), ([], ["2026-01-02T02:00:00Z"]))
+
+
+class Settings(unittest.TestCase):
+    def test_an_unset_list_uses_its_default_and_an_empty_one_stays_empty(self):
+        self.assertEqual(w.setting_list("NOT_SET", "A,B"), {"A", "B"})
+        with mock.patch.dict(os.environ, {"WAIT_LABEL_EMPTY_LIST": ""}):
+            self.assertEqual(w.setting_list("EMPTY_LIST", "A,B"), set())
+
+
+class GitHubCalls(unittest.TestCase):
+    def failing(self, tries):
+        with mock.patch("subprocess.run", return_value=mock.Mock(returncode=1, stderr="HTTP 404")) as run, \
+                mock.patch("time.sleep") as sleep, self.assertRaisesRegex(RuntimeError, "HTTP 404"):
+            w.gh("api", "x", tries=tries)
+        return run.call_count, sleep.call_count
+
+    def test_retries_wait_between_tries_only(self):
+        self.assertEqual(self.failing(3), (3, 2))
+
+    def test_no_tries_still_tries_once(self):
+        self.assertEqual(self.failing(0), (1, 0))
+
+
 class Labels(unittest.TestCase):
     def test_slashes_in_a_label_are_escaped(self):
         with mock.patch.object(w, "LABEL", "status/waiting on author"), mock.patch.object(w, "gh") as gh:
@@ -226,15 +279,24 @@ class Labels(unittest.TestCase):
         self.assertTrue(gh.call_args.args[-1].endswith("/labels/status%2Fwaiting%20on%20author"))
 
 
+class Action(unittest.TestCase):
+    def test_the_install_step_has_no_tokens(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "action.yml")
+        with open(path, encoding="utf-8") as action:
+            step = action.read().split("- name: Install")[1].split("- name: Sweep")[0]
+        self.assertIn("npm install", step)
+        self.assertNotRegex(step.lower(), "token|api-key|secret")
+
+
 class Run(unittest.TestCase):
-    def run_main(self, todo, argv=(), state=None, model=None):
+    def run_main(self, todo, argv=(), state=None, model=None, retries=0):
         """Runs main() with GitHub and the model faked, and returns the saved state and the window passed to collect."""
         folder = tempfile.mkdtemp()
         path = os.path.join(folder, "state", "state.json")
         if state:
             os.makedirs(os.path.dirname(path))
             with open(path, "w", encoding="utf-8") as out:
-                json.dump({"judged_through": state}, out)
+                json.dump({"judged_through": state, "retries": retries}, out)
         fake = mock.MagicMock()
         fake.__enter__.return_value = model or FakeModel(*[False] * 10)
         with mock.patch.object(w, "STATE_FILE", path), mock.patch.object(w, "MAX_JUDGMENTS", 2), \
@@ -246,7 +308,8 @@ class Run(unittest.TestCase):
         saved = None
         if os.path.exists(path):
             with open(path, encoding="utf-8") as saved_file:
-                saved = json.load(saved_file)["judged_through"]
+                state_saved = json.load(saved_file)
+            saved, self.retries = state_saved["judged_through"], state_saved["retries"]
         return saved, collect.call_args.args
 
     def test_starts_where_the_last_run_stopped_and_saves_the_new_end(self):
@@ -291,13 +354,6 @@ class Run(unittest.TestCase):
             self.run_main([], ["--apply"])
         self.assertIn("Unknown provider", str(stopped.exception))
 
-    def test_tools_are_installed_only_on_opening_a_model(self):
-        with mock.patch.object(w, "INSTALL", True), mock.patch.object(w, "install") as install:
-            self.run_main([], ["--apply"])
-            install.assert_not_called()
-            w.open_model()
-            install.assert_called_once()
-
     def test_no_model_is_opened_with_nothing_to_judge(self):
         self.run_main([], ["--apply"])
         self.assertFalse(self.opened)
@@ -306,15 +362,67 @@ class Run(unittest.TestCase):
         class Broken(FakeModel):
             def judge(self, prompt):
                 raise RuntimeError("bad token")
-        with self.assertRaises(SystemExit):
+        with mock.patch.object(w, "write_state") as write, self.assertRaises(SystemExit):
             self.run_main([("2026-01-02T00:00:00Z", 1, False, "p")], ["--apply"], model=Broken())
+        write.assert_not_called()
+
+    FAILED_SECOND = [("2026-01-02T00:00:00Z", 1, False, "p"), ("2026-01-02T12:00:00Z", 2, False, "bad")]
+
+    class FailsOnBad(FakeModel):
+        def judge(self, prompt):
+            if prompt == "bad":
+                raise RuntimeError("boom")
+            return {"waiting_on_author": False, "reason": "r"}, models.Usage()
+
+    def test_the_next_run_starts_again_from_a_failed_pr(self):
+        saved, _ = self.run_main(self.FAILED_SECOND, ["--apply"], state=START, model=self.FailsOnBad())
+        self.assertEqual((saved, self.retries), ("2026-01-02T11:59:59Z", 1))
+
+    def test_retries_run_out(self):
+        saved, window = self.run_main(self.FAILED_SECOND, ["--apply"], state=START, model=self.FailsOnBad(), retries=w.FAILURE_RETRIES)
+        self.assertEqual((saved, self.retries), (window[1], 0))
+
+    def test_a_retry_never_moves_back_past_the_start(self):
+        report = fresh_report() | {"failed_at": ["2025-01-01T00:00:00Z"]}
+        self.assertEqual(w.progress([], 0, START, END, report, 0), (START, 1))
+
+    def test_a_clean_run_clears_the_retries(self):
+        _, _ = self.run_main([], ["--apply"], state=START, retries=2)
+        self.assertEqual(self.retries, 0)
+
+    def test_progress_is_saved_after_each_pr(self):
+        todo = [("2026-01-02T00:00:00Z", 1, False, "p"), ("2026-01-02T12:00:00Z", 2, False, "p")]
+        with mock.patch.object(w, "write_state") as write:
+            self.run_main(todo, ["--apply"], state=START)
+        self.assertEqual(write.call_args_list[0].args, ("2026-01-02T11:59:59Z", 0))
+
+    def test_a_state_file_without_retries_still_reads(self):
+        path = os.path.join(tempfile.mkdtemp(), "state.json")
+        with open(path, "w", encoding="utf-8") as out:
+            json.dump({"judged_through": START}, out)
+        with mock.patch.object(w, "STATE_FILE", path):
+            self.assertEqual(w.read_state(), (START, 0))
 
 
 class Providers(unittest.TestCase):
-    def test_github_tokens_never_reach_the_model(self):
-        env = {"GH_TOKEN": "a", "GITHUB_TOKEN": "b", "WAIT_LABEL_COPILOT_TOKEN": "c", "EMPTY": "", "PATH": "p"}
-        with mock.patch.dict(os.environ, env, clear=True):
+    SECRETS = {"GH_TOKEN": "a", "GITHUB_TOKEN": "b", "WAIT_LABEL_COPILOT_TOKEN": "c", "CLAUDE_CODE_OAUTH_TOKEN": "d",
+               "ANTHROPIC_API_KEY": "e", "MY_JOB_SECRET": "f", "EMPTY": "", "PATH": "p"}
+
+    def test_secrets_never_reach_a_model_process(self):
+        with mock.patch.dict(os.environ, self.SECRETS, clear=True):
             self.assertEqual(models.model_env(), {"PATH": "p"})
+
+    def test_claude_gets_only_its_own_tokens(self):
+        with mock.patch.dict(os.environ, self.SECRETS, clear=True), mock.patch("subprocess.run") as run:
+            run.return_value = mock.Mock(stdout=json.dumps({"structured_output": {"waiting_on_author": False}}))
+            models.ClaudeModel("m", "s", {}).judge("p")
+        self.assertEqual(run.call_args.kwargs["env"], {"CLAUDE_CODE_OAUTH_TOKEN": "d", "ANTHROPIC_API_KEY": "e", "PATH": "p"})
+
+    def test_a_claude_timeout_keeps_the_prompt_out_of_the_error(self):
+        with mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired(["claude", "secret prompt"], 300)):
+            with self.assertRaises(RuntimeError) as failed:
+                models.ClaudeModel("m", "secret prompt", {}).judge("p")
+        self.assertNotIn("secret prompt", str(failed.exception))
 
     def test_claude_reads_structured_output_and_usage(self):
         result = {"structured_output": {"waiting_on_author": True, "reason": "r"}, "total_cost_usd": 0.5,
@@ -337,31 +445,6 @@ class Providers(unittest.TestCase):
         with mock.patch("subprocess.run", return_value=mock.Mock(stdout="", stderr="Invalid token\n", returncode=1)):
             with self.assertRaisesRegex(RuntimeError, "Invalid token"):
                 models.ClaudeModel("m", "s", {}).judge("p")
-
-    def test_install_uses_the_provider_and_version(self):
-        with mock.patch("subprocess.run") as run:
-            models.install("claude", "1.2.3", "4.5.6")
-        self.assertIn("@anthropic-ai/claude-code@1.2.3", run.call_args.args[0])
-        with mock.patch("subprocess.run") as run, mock.patch.object(sys, "path", list(sys.path)):
-            models.install("copilot", "1.2.3", "4.5.6")
-        self.assertIn("github-copilot-sdk==4.5.6", run.call_args.args[0])
-
-    def test_installs_see_no_tokens(self):
-        env = {"GH_TOKEN": "a", "GITHUB_TOKEN": "b", "WAIT_LABEL_COPILOT_TOKEN": "c",
-               "CLAUDE_CODE_OAUTH_TOKEN": "d", "ANTHROPIC_API_KEY": "e", "PATH": "p"}
-        for provider in ("claude", "copilot"):
-            with mock.patch.dict(os.environ, env, clear=True), mock.patch("subprocess.run") as run, \
-                    mock.patch.object(sys, "path", list(sys.path)), mock.patch("tempfile.mkdtemp", return_value="t"):
-                models.install(provider, "1.2.3", "4.5.6")
-            self.assertEqual(run.call_args.kwargs["env"], {"PATH": "p"})
-
-    def test_only_claude_code_may_run_install_scripts(self):
-        with mock.patch("subprocess.run") as run:
-            models.install("claude", "1.2.3", "4.5.6")
-        self.assertIn("--allow-scripts=@anthropic-ai/claude-code", run.call_args.args[0])
-        with mock.patch("subprocess.run") as run, mock.patch.object(sys, "path", list(sys.path)):
-            models.install("copilot", "1.2.3", "4.5.6")
-        self.assertIn(":all:", run.call_args.args[0])
 
     def test_claude_errors_raise(self):
         with mock.patch("subprocess.run", return_value=mock.Mock(stdout=json.dumps({"is_error": True, "result": "no"}))):

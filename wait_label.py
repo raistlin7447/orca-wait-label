@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
-from models import ClaudeModel, CopilotModel, Usage, install
+from models import ClaudeModel, CopilotModel, Usage
 
 
 def setting(name, default):
@@ -24,7 +24,8 @@ def setting(name, default):
 
 
 def setting_list(name, default):
-    return {s.strip() for s in setting(name, default).split(",") if s.strip()}
+    # Unlike a single setting, a list can be set to empty
+    return {s.strip() for s in os.environ.get(f"WAIT_LABEL_{name}", default).split(",") if s.strip()}
 
 
 def login_list(name, default):
@@ -43,10 +44,6 @@ IGNORED_USERS = login_list("IGNORED_USERS", "github-actions,copilot-pull-request
 # Comments starting with this are commands to another bot, not conversation
 COMMAND_PREFIX = setting("COMMAND_PREFIX", "")
 PROVIDER = setting("PROVIDER", "copilot")
-# The Action installs the provider's tools only once a run has something to judge
-INSTALL = setting("INSTALL", "false") == "true"
-CLAUDE_CODE_VERSION = setting("CLAUDE_CODE_VERSION", "2.1.318")
-COPILOT_SDK_VERSION = setting("COPILOT_SDK_VERSION", "1.0.28")
 # Empty lets Copilot pick, the only choice on its Free plan
 MODEL = setting("MODEL", "claude-sonnet-5-5" if PROVIDER == "claude" else "")
 CLAUDE_BIN = setting("CLAUDE_BIN", "claude")
@@ -58,6 +55,8 @@ MAX_TEXT = int(setting("MAX_TEXT", "2000"))
 LABEL_DRAFTS = setting("LABEL_DRAFTS", "false") == "true"
 # PRs judged per run, with 0 for no limit
 MAX_JUDGMENTS = int(setting("MAX_JUDGMENTS", "20"))
+# Runs that start again from a failed PR before moving past it
+FAILURE_RETRIES = int(setting("FAILURE_RETRIES", "3"))
 # Hours to look back without saved progress, with 0 for every open PR
 LOOKBACK_HOURS = float(setting("LOOKBACK_HOURS", "0"))
 LOG_REASONS = setting("LOG_REASONS", "false") == "true"
@@ -80,7 +79,6 @@ SEARCH_LIMIT = 1000
 
 PR_FIELDS = """
   number title isDraft updatedAt author { login }
-  labels(first: 30) { nodes { name } }
   labeled: timelineItems(last: %(label_events)d, itemTypes: [LABELED_EVENT, UNLABELED_EVENT]) { nodes { __typename
     ... on LabeledEvent { createdAt label { name } } ... on UnlabeledEvent { createdAt label { name } } } }
   comments(last: %(comments)d) { nodes { author { login } authorAssociation createdAt bodyText } }
@@ -133,11 +131,13 @@ def one_line(text):
 
 def gh(*args, tries=GITHUB_TRIES):
     # GitHub answers a search with this many nested fields with an occasional 502
-    for attempt in range(tries):
+    tries = max(tries, 1)
+    for attempt in range(1, tries + 1):
         out = subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8")
         if out.returncode == 0:
             return out.stdout
-        time.sleep(GITHUB_RETRY_DELAY)
+        if attempt < tries:
+            time.sleep(GITHUB_RETRY_DELAY)
     raise RuntimeError(f"gh {args[0]} {args[1]} failed: {out.stderr.strip()}")
 
 
@@ -163,7 +163,7 @@ def commit_login(actor):
 
 
 def events(pr):
-    """Author and team activity as (time, login, kind, text), oldest first; bots, commands and others left out."""
+    """Author and team activity as (time, login, association, kind, text), oldest first; bots, commands and others left out."""
     author = pr["author"]["login"]
     out = []
     for c in pr["comments"]["nodes"]:
@@ -178,11 +178,12 @@ def events(pr):
         out.append((r["submittedAt"], login, r["authorAssociation"], "review " + r["state"], text))
     for c in pr["commits"]["nodes"]:
         c = c["commit"]
-        committer = commit_login(c["committer"])
+        committer, writer = commit_login(c["committer"]), commit_login(c["author"])
         # A web editor commit has committer web-flow; "Update branch" rebases keep the old authored date
-        web_edit = committer == "web-flow" and commit_login(c["author"]) == author \
-            and c["authoredDate"] == c["committedDate"]
-        if committer == author or web_edit:
+        web_edit = committer == "web-flow" and writer == author and c["authoredDate"] == c["committedDate"]
+        # An email linked to no account names nobody, and the PR author is the likeliest to have pushed it
+        unlinked = committer is None and writer in (None, author)
+        if committer == author or web_edit or unlinked:
             out.append((c["committedDate"], author, "", "commit", ""))
     return sorted(e for e in out if e[1] == author or e[2] in TEAM or e[1].lower() in TEAM_USERS)
 
@@ -193,26 +194,32 @@ def label_changed(pr, types=("LabeledEvent", "UnlabeledEvent")):
 
 
 def decide(pr, labeled, start, end):
-    """'remove', 'judge' or None for a PR whose latest activity falls in (start, end]."""
+    """'remove', 'judge' or None for a PR found by a search since start, whose activity must not be after end."""
     author = pr["author"]["login"]
     evs = events(pr)
-    if not evs or not start < evs[-1][0] <= end:
-        return None
-    # Nobody on the team has spoken, so nobody has asked the author for anything
-    if not labeled and all(e[1] == author for e in evs):
+    if not evs or evs[-1][0] > end:
         return None
     # A label change after the latest activity, by a person or by this bot, already settled it
     if label_changed(pr) > evs[-1][0]:
         return None
-    if labeled and any(e[1] == author and e[3] == "commit" and e[0] > label_changed(pr, ("LabeledEvent",)) for e in evs):
+    # A commit can be pushed long after its date, so start doesn't apply to it
+    # Other labels' events can push this label's out of the fetched history, which leaves labeled_at empty
+    labeled_at = label_changed(pr, ("LabeledEvent",))
+    if labeled and labeled_at and any(e[1] == author and e[3] == "commit" and e[0] > labeled_at for e in evs):
         return "remove"
+    if evs[-1][0] <= start:
+        return None
+    # Nobody on the team has spoken, so nobody has asked the author for anything
+    if not labeled and all(e[1] == author for e in evs):
+        return None
     # The author of a draft is still working on it, so by default the bot never starts a wait there
     return None if pr["isDraft"] and not labeled and not LABEL_DRAFTS else "judge"
 
 
 def prompt_for(pr, evs=None):
     lines = [f"PR #{pr['number']}: {pr['title']}", f"PR author: @{pr['author']['login']}", "", "Recent messages, oldest first:"]
-    for t, login, _, kind, text in (evs or events(pr))[-CONTEXT_MESSAGES:]:
+    evs = evs or events(pr)
+    for t, login, _, kind, text in evs[max(len(evs) - CONTEXT_MESSAGES, 0):]:
         who = "PR author" if login == pr["author"]["login"] else "team member"
         body = "(pushed commits)" if kind == "commit" else (text[:MAX_TEXT] or "(no text)")
         lines += [f"--- @{login}, {who} ({kind}, {t[:10]}):", body]
@@ -220,8 +227,6 @@ def prompt_for(pr, evs=None):
 
 
 def open_model():
-    if INSTALL:
-        install(PROVIDER, CLAUDE_CODE_VERSION, COPILOT_SDK_VERSION)
     if PROVIDER == "claude":
         return ClaudeModel(MODEL, SYSTEM_PROMPT, SCHEMA, CLAUDE_BIN, MODEL_TIMEOUT, EFFORT)
     return CopilotModel(MODEL or None, SYSTEM_PROMPT, SCHEMA, os.environ.get("WAIT_LABEL_COPILOT_TOKEN"), MODEL_TIMEOUT, EFFORT)
@@ -272,6 +277,7 @@ def collect(start, end, apply, report):
                     report["removed"].append(pr["number"])
                 except RuntimeError as error:
                     print(f"::warning::Cannot remove the label from #{pr['number']}: {one_line(error)}")
+                    report["failed_at"].append(events(pr)[-1][0])
             elif action == "judge":
                 todo.append((events(pr)[-1][0], pr["number"], labeled, prompt_for(pr)))
     return sorted(todo), end
@@ -289,8 +295,8 @@ def judge(model, prompt, usage):
     return verdict
 
 
-def judge_all(todo, model, apply, report):
-    for _, number, labeled, prompt in todo:
+def judge_all(todo, model, apply, report, checkpoint=lambda done: None):
+    for done, (when, number, labeled, prompt) in enumerate(todo, 1):
         try:
             verdict = judge(model, prompt, report["usage"])
             report["judged"] += 1
@@ -301,9 +307,10 @@ def judge_all(todo, model, apply, report):
                 set_label(number, not labeled, apply)
                 report["removed" if labeled else "added"].append(number)
         except Exception as error:
-            # The label stays as it is until the PR has new activity
             print(f"::warning::Cannot judge #{number}: {one_line(error)}")
             report["failures"] += 1
+            report["failed_at"].append(when)
+        checkpoint(done)
 
 
 def write_report(report, through):
@@ -327,12 +334,32 @@ def before(time_text):
     return (datetime.strptime(time_text, STAMP) - timedelta(seconds=1)).strftime(STAMP)
 
 
+def progress(todo, done, start, end, report, retries):
+    """The time to resume from after the first done PRs of todo, and the retries used so far."""
+    resume = end if done == len(todo) else before(todo[done][0])
+    # The limit stops one PR that always fails from holding the run back for good
+    if report["failed_at"] and retries < FAILURE_RETRIES:
+        return max(start, min(resume, before(min(report["failed_at"])))), retries + 1
+    return resume, 0
+
+
 def read_state():
+    """The time the last run judged up to and the retries it used, or None and 0 without saved progress."""
     try:
         with open(STATE_FILE, encoding="utf-8") as state:
-            return json.load(state)["judged_through"]
+            saved = json.load(state)
+        return saved["judged_through"], saved.get("retries", 0)
     except (OSError, ValueError, KeyError):
-        return None
+        return None, 0
+
+
+def write_state(through, retries):
+    if STATE_FILE:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        # A run cancelled partway through a write must not leave a broken file
+        with open(STATE_FILE + ".tmp", "w", encoding="utf-8") as state:
+            json.dump({"judged_through": through, "retries": retries}, state)
+        os.replace(STATE_FILE + ".tmp", STATE_FILE)
 
 
 def main():
@@ -348,12 +375,12 @@ def main():
     # A PR is judged once it has been quiet for QUIET_MINUTES, so the window ends that long ago
     end_time = datetime.now(timezone.utc) - timedelta(minutes=QUIET_MINUTES)
     end = end_time.strftime(STAMP)
-    saved = read_state()
+    saved, retries = read_state()
     start = args.since or saved or (LOOKBACK_HOURS and (end_time - timedelta(hours=LOOKBACK_HOURS)).strftime(STAMP)) or ""
     if not args.since and not saved:
         print(f"No saved progress, so starting from {start or 'the oldest open PR'}")
 
-    report = {"added": [], "removed": [], "judged": 0, "held": 0, "failures": 0, "usage": Usage()}
+    report = {"added": [], "removed": [], "judged": 0, "held": 0, "failures": 0, "failed_at": [], "usage": Usage()}
     if args.apply:
         ensure_label()
     todo, end = collect(start, end, args.apply, report)
@@ -371,17 +398,21 @@ def main():
         todo = todo[:MAX_JUDGMENTS]
         # More PRs in one second than the cap would otherwise never get past that second
         end = resume if resume > start else todo[-1][0]
+
+    def checkpoint(done):
+        # A run cut off by its timeout keeps its place, unless nothing has worked yet
+        if report["failures"] < done:
+            write_state(*progress(todo, done, start, end, report, retries))
+
     if todo:
         with open_model() as model:
-            judge_all(todo, model, args.apply, report)
-    write_report(report, end)
+            judge_all(todo, model, args.apply, report, checkpoint)
+    through, retries = progress(todo, len(todo), start, end, report, retries)
+    write_report(report, through)
     # Every call failing means the token or the model is broken
     if todo and report["failures"] == len(todo):
         sys.exit("Every judgment failed")
-    if STATE_FILE:
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        with open(STATE_FILE, "w", encoding="utf-8") as state:
-            json.dump({"judged_through": end}, state)
+    write_state(through, retries)
 
 
 if __name__ == "__main__":

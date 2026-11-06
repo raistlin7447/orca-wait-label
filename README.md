@@ -120,9 +120,9 @@ The first runs work through every open PR, oldest first, 20 PRs at a time, and l
 
 Progress is saved in the Actions cache, and GitHub removes a cache that goes unused for 7 days. A run with no saved progress works through every open PR again, which spends credits again. Set `lookback-hours` to limit how far back it goes.
 
-The Action needs a Linux or macOS runner with `gh`, plus `python3` and `pip` for Copilot (Python 3.11 or newer) or `npm` for Claude. `ubuntu-latest` has them all. It hasn't been tested on GitHub Enterprise Server.
+The Action needs a Linux or macOS runner with `gh` and `python3`, plus `pip` and Python 3.11 or newer for Copilot, or `npm` for Claude. `ubuntu-latest` has them all. It hasn't been tested on GitHub Enterprise Server.
 
-To stop the code that handles your token from changing, pin the Action to a commit SHA instead of `@v1`.
+To stop the code that handles your token from changing, pin the Action to a commit SHA instead of `@v1`. Each run installs the provider's tools in a step without your tokens. That limits what a bad package can read, but code running on a runner can still reach the job's secrets, so use tool versions you trust.
 
 On a repository with little activity, GitHub can run a schedule far less often than you asked. Labels update later in that case, and each run still starts where the last one stopped. A timer elsewhere can also start the workflow, with `gh workflow run`.
 
@@ -133,12 +133,13 @@ Model names differ between providers, such as `claude-sonnet-5.5` on Copilot and
 Each run looks at open PRs with new activity from the PR author or a team member. Bots are ignored. A PR is judged once its conversation has been quiet for 30 minutes (by default), so a quick back-and-forth is judged once, at the end.
 
 - A PR without the label is skipped until a team member has spoken, which costs no model call.
-- A commit by the author after the label was added removes it.
+- A commit by the author dated after the label was added removes it, however late it was pushed. GitHub doesn't report push times, so a commit made before the label and pushed after it isn't noticed. A commit from an email linked to no GitHub account counts as the author's.
 - Otherwise the model reads the last few messages and decides whether the review is waiting on the PR author, and the label is set to match.
 - A "waiting" answer has to come back three times in a row (by default). If the calls disagree, the PR counts as not waiting, because a wrong label takes a PR out of your review queue.
 - A label change made after the latest activity, by a person or by this Action, is left alone until there is new activity.
 - The Action never adds the label to a draft (by default).
-- A PR that can't be judged is left as it is until its next activity. If every judgment in a run fails, the run fails and the next run tries them again.
+- If a PR can't be judged or its label can't be changed, the next runs start again from that PR, up to `failure-retries` times, and then move past it until its next activity. If every judgment in a run fails, the run fails and keeps its place.
+- A run that hits its timeout keeps the progress it made.
 
 ## Inputs
 
@@ -156,9 +157,9 @@ Each run looks at open PRs with new activity from the PR author or a team member
 | `label` | `waiting on author` | The label's name. It is created if it is missing |
 | `label-color` | `fbca04` | The color for a label this Action creates |
 | `label-drafts` | `false` | Whether the label can be added to draft PRs |
-| `team-associations` | `OWNER,MEMBER,COLLABORATOR` | Who counts as the team, by GitHub's author association |
+| `team-associations` | `OWNER,MEMBER,COLLABORATOR` | Who counts as the team, by GitHub's author association. Empty leaves only `team-users` |
 | `team-users` | | Comma-separated logins that also count as the team |
-| `ignored-users` | `github-actions,copilot-pull-request-reviewer,Copilot,coderabbitai,dependabot` | Accounts whose comments are ignored, besides any `[bot]` account |
+| `ignored-users` | `github-actions,copilot-pull-request-reviewer,Copilot,coderabbitai,dependabot` | Accounts whose comments are ignored, besides any `[bot]` account. Empty ignores no others |
 | `command-prefix` | | Comments starting with this are commands to another bot, not conversation |
 | `model` | `claude-sonnet-5-5` for `claude`, Copilot's pick for `copilot` | The model that judges |
 | `confirmations` | `2` | Extra calls that must agree before a "waiting" answer stands |
@@ -166,6 +167,7 @@ Each run looks at open PRs with new activity from the PR author or a team member
 | `context-messages` | `6` | How many recent messages the model reads |
 | `max-text` | `2000` | Characters kept from each message |
 | `max-judgments` | `20` | PRs judged per run, with the rest held for the next run. `0` means no limit |
+| `failure-retries` | `3` | How many later runs start again from a failed PR before moving past it |
 | `model-timeout` | `300` | Seconds to wait for each model call |
 | `effort` | | Reasoning effort, from `low`, `medium`, `high`, `xhigh` and `max`. Empty leaves the provider's default |
 | `github-tries` | `3` | How many times to try a GitHub search before giving up |
@@ -175,7 +177,7 @@ Each run looks at open PRs with new activity from the PR author or a team member
 | `max-review-comments` | `20` | Inline comments fetched per review |
 | `max-commits` | `10` | Commits fetched per PR, newest first |
 | `max-label-events` | `30` | Label changes fetched per PR, newest first |
-| `prompt-file` | (built in) | A file with your own instructions for the model; check out your repository first. `{project}` becomes the repository name |
+| `prompt-file` | (built in) | A file with your own instructions for the model. Check out your repository first, with `persist-credentials: false` so that the token isn't left on disk. `{project}` becomes the repository name |
 | `log-reasons` | `false` | Log the model's reason for each PR. Actions logs are public on a public repository |
 | `claude-code-version` | `2.1.318` | The Claude Code CLI version to install |
 | `copilot-sdk-version` | `1.0.28` | The Copilot SDK version to install |
