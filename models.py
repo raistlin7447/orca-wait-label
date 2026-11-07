@@ -86,12 +86,17 @@ class ClaudeModel:
             family = exact or [m for m in available if m["id"].split("-")[1:2] == [self.model.lower()]]
             if not family:
                 raise BadSetting(f"model must be one of {', '.join(m['id'] for m in available)}, or a family such as sonnet, not {self.model!r}")
-            info = max(family, key=lambda m: m["created_at"])
+            info = max(family, key=lambda m: m.get("created_at", ""))
             if not exact:
                 print(f"Using {info['id']} for model {self.model}")
             # The CLI gets the full ID, so that it runs the model checked here
             self.model = info["id"]
-        effort = info["capabilities"]["effort"]
+        effort = info.get("capabilities", {}).get("effort")
+        # A gateway's model list may leave out what each model supports
+        if effort is None:
+            if self.effort:
+                print(f"The model list doesn't say which efforts {self.model} takes, so effort goes to Claude unchecked")
+            return self
         check_effort(self.model, self.effort, [k for k, v in effort.items() if isinstance(v, dict) and v["supported"]])
         return self
 
@@ -106,13 +111,20 @@ class ClaudeModel:
         else:
             headers.update({"Authorization": f"Bearer {os.environ.get('CLAUDE_CODE_OAUTH_TOKEN', '')}",
                             "anthropic-beta": "oauth-2025-04-20"})
-        url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/") + path
+        base = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+        url = base.rstrip("/") + path
+        try:
+            request = urllib.request.Request(url, headers=headers)
+        except ValueError:
+            raise BadSetting(f"ANTHROPIC_BASE_URL must be a full URL, such as https://api.anthropic.com, not {base!r}") from None
         for attempt in range(1, LOOKUP_TRIES + 1):
             try:
-                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=LOOKUP_TIMEOUT) as response:
-                    return json.load(response)
-            except ValueError:
-                raise RuntimeError(f"Anthropic's model list at {url} didn't answer with JSON") from None
+                with urllib.request.urlopen(request, timeout=LOOKUP_TIMEOUT) as response:
+                    body = response.read()
+                try:
+                    return json.loads(body)
+                except ValueError:
+                    raise RuntimeError(f"Anthropic's model list at {url} didn't answer with JSON") from None
             except urllib.error.HTTPError as error:
                 if error.code == 404:
                     return None
@@ -181,8 +193,10 @@ class CopilotModel:
         check_effort(self.model, self.effort, info.supported_reasoning_efforts or [])
 
     def __exit__(self, *_):
-        self.loop.run_until_complete(self.client.stop())
-        self.loop.close()
+        try:
+            self.loop.run_until_complete(self.client.stop())
+        finally:
+            self.loop.close()
 
     async def ask(self, prompt):
         session = await self.client.create_session(

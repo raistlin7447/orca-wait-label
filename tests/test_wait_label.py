@@ -783,6 +783,17 @@ class Providers(unittest.TestCase):
             self.assertEqual(self.claude(effort="high").model, "claude-sonnet-5-5")
         self.assertEqual(out.getvalue(), "")
 
+    def test_a_gateway_list_without_capabilities_skips_the_effort_check(self):
+        out = io.StringIO()
+        with self.answers(None, {"data": [{"id": "claude-sonnet-5-5"}]}), contextlib.redirect_stdout(out):
+            self.assertEqual(self.claude(effort="high").model, "claude-sonnet-5-5")
+        self.assertIn("effort goes to Claude unchecked", out.getvalue())
+
+    def test_a_base_url_without_a_scheme_names_the_setting(self):
+        with mock.patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "api.example.com"}), \
+                self.assertRaisesRegex(models.BadSetting, "ANTHROPIC_BASE_URL must be a full URL"):
+            self.claude()
+
     def test_a_gateway_without_a_model_list_skips_the_check(self):
         out = io.StringIO()
         with self.answers(None, None), contextlib.redirect_stdout(out):
@@ -806,10 +817,11 @@ class Providers(unittest.TestCase):
 
             async def list_models(self):
                 raise ConnectionError("denied")
+        model = models.CopilotModel("auto", "s", {}, "t")
         with mock.patch.dict(sys.modules, {"copilot": mock.Mock(CopilotClient=Client)}), \
                 self.assertRaisesRegex(RuntimeError, "Copilot's model list failed: denied"):
-            models.CopilotModel("auto", "s", {}, "t").__enter__()
-        self.assertTrue(Client.stopped)
+            model.__enter__()
+        self.assertTrue(Client.stopped and model.loop.is_closed())
 
     def test_copilot_checks_effort_against_the_model(self):
         model = models.CopilotModel("kimi-k3", "s", {}, "t", effort="medium")
