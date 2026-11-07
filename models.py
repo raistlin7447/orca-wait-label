@@ -4,7 +4,10 @@ import json
 import os
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
+from urllib.parse import quote
 
 
 @dataclass
@@ -19,6 +22,10 @@ class Usage:
     def add(self, other):
         for field in self.__dataclass_fields__:
             setattr(self, field, getattr(self, field) + getattr(other, field))
+
+
+class BadSetting(Exception):
+    """An input the provider can't use, such as a model it doesn't have."""
 
 
 class UnusableAnswer(Exception):
@@ -37,6 +44,14 @@ def answer_json(text):
         raise UnusableAnswer("the answer isn't JSON") from None
 
 
+def check_effort(model, effort, levels):
+    """Stops the run for an effort the model doesn't take, naming the levels it does."""
+    if effort and not levels:
+        raise BadSetting(f"effort must be empty for {model}, which takes no effort setting, not {effort!r}")
+    if effort and effort not in levels:
+        raise BadSetting(f"effort must be one of {', '.join(levels)} for {model}, not {effort!r}")
+
+
 def model_env(keep=()):
     """The environment for a model process, with every likely secret removed except those named in keep."""
     return {k: v for k, v in os.environ.items()
@@ -45,16 +60,46 @@ def model_env(keep=()):
 
 class ClaudeModel:
     def __init__(self, model, system_prompt, schema, binary="claude", timeout=300, effort=""):
-        self.timeout = timeout
+        self.model, self.effort, self.timeout = model, effort, timeout
         self.args = [binary, "-p", "--tools", "", "--strict-mcp-config", "--setting-sources", "",
                      "--no-session-persistence", "--model", model, "--system-prompt", system_prompt,
                      "--json-schema", json.dumps(schema), "--output-format", "json"] + (["--effort", effort] if effort else [])
 
     def __enter__(self):
+        info = self.lookup(f"/v1/models/{quote(self.model, safe='')}")
+        if info is None:
+            available = self.lookup("/v1/models?limit=1000")["data"]
+            # A family name such as sonnet means its newest model, as in claude-sonnet-5-5
+            family = [m for m in available if m["id"].split("-")[1:2] == [self.model.lower()]]
+            if not family:
+                raise BadSetting(f"model must be one of {', '.join(m['id'] for m in available)}, or a family such as sonnet, not {self.model!r}")
+            info = max(family, key=lambda m: m["created_at"])
+            print(f"Using {info['id']} for model {self.model}")
+            # The CLI gets the full ID, so that it runs the model checked here
+            self.model = self.args[self.args.index("--model") + 1] = info["id"]
+        effort = info["capabilities"]["effort"]
+        check_effort(self.model, self.effort, [k for k, v in effort.items() if isinstance(v, dict) and v["supported"]])
         return self
 
     def __exit__(self, *_):
         pass
+
+    def lookup(self, path):
+        """An answer from Anthropic's Models API, or None when it has no such model."""
+        headers = {"anthropic-version": "2023-06-01"}
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            headers["x-api-key"] = os.environ["ANTHROPIC_API_KEY"]
+        else:
+            headers.update({"Authorization": f"Bearer {os.environ.get('CLAUDE_CODE_OAUTH_TOKEN', '')}",
+                            "anthropic-beta": "oauth-2025-04-20"})
+        url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/") + path
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=self.timeout) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return None
+            raise RuntimeError(f"Anthropic's model list answered {error.code}: {error.read().decode(errors='replace')[:300]}") from None
 
     def judge(self, prompt):
         try:
@@ -89,7 +134,20 @@ class CopilotModel:
         self.client = CopilotClient(github_token=self.token, mode="empty", env=model_env(),
                                     base_directory=tempfile.mkdtemp())
         self.loop.run_until_complete(self.client.start())
+        if self.model:
+            try:
+                self.check(self.loop.run_until_complete(self.client.list_models()))
+            except BadSetting:
+                self.__exit__()
+                raise
         return self
+
+    def check(self, available):
+        info = next((m for m in available if m.id == self.model), None)
+        # Copilot answers with another model when it doesn't know the one asked for
+        if info is None:
+            raise BadSetting(f"model must be one of {', '.join(m.id for m in available)}, not {self.model!r}")
+        check_effort(self.model, self.effort, info.supported_reasoning_efforts or [])
 
     def __exit__(self, *_):
         self.loop.run_until_complete(self.client.stop())

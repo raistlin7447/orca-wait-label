@@ -9,13 +9,14 @@ can be changed with a WAIT_LABEL_* environment variable, which action.yml sets f
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
-from models import ClaudeModel, CopilotModel, UnusableAnswer, Usage
+from models import BadSetting, ClaudeModel, CopilotModel, UnusableAnswer, Usage
 
 
 def setting(name, default):
@@ -29,48 +30,85 @@ def setting_list(name, default):
 
 
 def login_list(name, default):
-    # GitHub logins are case-insensitive
-    return {s.lower() for s in setting_list(name, default)}
+    # GitHub logins are case-insensitive, and people often write them as @mentions
+    return {s.lower().lstrip("@") for s in setting_list(name, default)}
+
+
+def bad_setting(name, value, wanted):
+    """Stops the run, naming the input as action.yml spells it."""
+    sys.exit(f"{name.lower().replace('_', '-')} must be {wanted}, not {value!r}")
+
+
+def number(name, default, kind=int):
+    value = setting(name, default)
+    try:
+        parsed = kind(value)
+    except ValueError:
+        parsed = -1
+    if not parsed >= 0:
+        bad_setting(name, value, "a whole number of 0 or more" if kind is int else "a number of 0 or more")
+    return parsed
+
+
+def flag(name, default):
+    value = setting(name, default)
+    if value.lower() not in ("true", "false"):
+        bad_setting(name, value, "true or false")
+    return value.lower() == "true"
+
+
+def choice(name, default, choices):
+    value = setting(name, default)
+    if value not in choices:
+        bad_setting(name, value, "one of " + ", ".join(c for c in choices if c))
+    return value
 
 
 REPO_OWNER, REPO_NAME = setting("REPO", os.environ.get("GITHUB_REPOSITORY", "/")).split("/")
 LABEL = setting("LABEL", "waiting on author")
-LABEL_COLOR = setting("LABEL_COLOR", "fbca04")
+LABEL_COLOR = setting("LABEL_COLOR", "fbca04").lstrip("#")
+if not re.fullmatch("[0-9a-fA-F]{6}", LABEL_COLOR):
+    bad_setting("LABEL_COLOR", LABEL_COLOR, "six hex digits, such as fbca04")
+ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "MANNEQUIN", "NONE")
 # Comment and review associations that count as the team
 TEAM = {s.upper() for s in setting_list("TEAM_ASSOCIATIONS", "OWNER,MEMBER,COLLABORATOR")}
+if TEAM - set(ASSOCIATIONS):
+    bad_setting("TEAM_ASSOCIATIONS", ",".join(sorted(TEAM - set(ASSOCIATIONS))), "made of " + ", ".join(ASSOCIATIONS))
 # Logins that count as the team, whatever their association
 TEAM_USERS = login_list("TEAM_USERS", "")
 IGNORED_USERS = login_list("IGNORED_USERS", "")
 # Comments starting with this are commands to another bot, not conversation
 COMMAND_PREFIX = setting("COMMAND_PREFIX", "")
-PROVIDER = setting("PROVIDER", "copilot")
+PROVIDER = choice("PROVIDER", "copilot", ("copilot", "claude"))
 # Empty lets Copilot pick, the only choice on its Free plan
 MODEL = setting("MODEL", "claude-sonnet-5-5" if PROVIDER == "claude" else "")
 CLAUDE_BIN = setting("CLAUDE_BIN", "claude")
 # Further calls that must agree before a "waiting" verdict stands
-CONFIRMATIONS = int(setting("CONFIRMATIONS", "2"))
-QUIET_MINUTES = int(setting("QUIET_MINUTES", "30"))
-CONTEXT_MESSAGES = int(setting("CONTEXT_MESSAGES", "6"))
-MAX_TEXT = int(setting("MAX_TEXT", "2000"))
-LABEL_DRAFTS = setting("LABEL_DRAFTS", "false") == "true"
+CONFIRMATIONS = number("CONFIRMATIONS", "2")
+QUIET_MINUTES = number("QUIET_MINUTES", "30")
+CONTEXT_MESSAGES = number("CONTEXT_MESSAGES", "6")
+MAX_TEXT = number("MAX_TEXT", "2000")
+LABEL_DRAFTS = flag("LABEL_DRAFTS", "false")
+# GitHub search terms that narrow which open PRs the Action looks at
+PR_FILTER = setting("PR_FILTER", "")
 # PRs judged per run, with 0 for no limit
-MAX_JUDGMENTS = int(setting("MAX_JUDGMENTS", "20"))
+MAX_JUDGMENTS = number("MAX_JUDGMENTS", "20")
 # Runs that start again from a failed PR before moving past it
-FAILURE_RETRIES = int(setting("FAILURE_RETRIES", "3"))
+FAILURE_RETRIES = number("FAILURE_RETRIES", "3")
 # Hours to look back without saved progress, with 0 for every open PR
-LOOKBACK_HOURS = float(setting("LOOKBACK_HOURS", "0"))
-LOG_REASONS = setting("LOG_REASONS", "false") == "true"
-MODEL_TIMEOUT = int(setting("MODEL_TIMEOUT", "300"))
+LOOKBACK_HOURS = number("LOOKBACK_HOURS", "0", float)
+LOG_REASONS = flag("LOG_REASONS", "false")
+MODEL_TIMEOUT = number("MODEL_TIMEOUT", "300")
 # Empty leaves the provider's default
 EFFORT = setting("EFFORT", "")
-GITHUB_TRIES = int(setting("GITHUB_TRIES", "3"))
-GITHUB_RETRY_DELAY = int(setting("GITHUB_RETRY_DELAY", "10"))
+GITHUB_TRIES = number("GITHUB_TRIES", "3")
+GITHUB_RETRY_DELAY = number("GITHUB_RETRY_DELAY", "10")
 # CONTEXT_MESSAGES can only read what these limits fetch
-MAX_COMMENTS = int(setting("MAX_COMMENTS", "30"))
-MAX_REVIEWS = int(setting("MAX_REVIEWS", "20"))
-MAX_REVIEW_COMMENTS = int(setting("MAX_REVIEW_COMMENTS", "20"))
-MAX_COMMITS = int(setting("MAX_COMMITS", "10"))
-MAX_LABEL_EVENTS = int(setting("MAX_LABEL_EVENTS", "30"))
+MAX_COMMENTS = number("MAX_COMMENTS", "30")
+MAX_REVIEWS = number("MAX_REVIEWS", "20")
+MAX_REVIEW_COMMENTS = number("MAX_REVIEW_COMMENTS", "20")
+MAX_COMMITS = number("MAX_COMMITS", "10")
+MAX_LABEL_EVENTS = number("MAX_LABEL_EVENTS", "30")
 # A file with the time the last run judged up to
 STATE_FILE = setting("STATE_FILE", "")
 STAMP = "%Y-%m-%dT%H:%M:%SZ"
@@ -290,10 +328,35 @@ def set_label(number, add, apply):
     print(f"{'ADD' if add else 'REMOVE'} #{number}" + ("" if apply else " (dry run)"))
 
 
-def collect(start, end, apply, report):
+# The Action's searches already ask for open PRs, so these terms either repeat that or contradict it
+OPEN_PRS = ("is:pr", "type:pr", "is:open", "state:open")
+OTHER_STATES = ("is:closed", "state:closed", "is:merged", "is:issue", "type:issue")
+
+
+def pr_filter(text):
+    """The terms of a pr-filter search to add to the Action's own, and the ones left out because the Action sets them."""
+    kept, dropped = [], []
+    for term in re.findall(r'-?[^\s:"]+:(?:"[^"]*"|[^\s"])+|"[^"]*"|\S+', text):
+        negated = term.startswith("-")
+        key, _, value = term.lower().lstrip("-").partition(":")
+        state = f"{key}:{value}"
+        if key in ("sort", "updated") or (not negated and state in OPEN_PRS):
+            dropped.append(term)
+        elif key in ("repo", "org", "user", "owner"):
+            raise ValueError(f"pr-filter can't use {term}, because the repository input sets the repository")
+        elif state in (OPEN_PRS if negated else OTHER_STATES):
+            raise ValueError(f"pr-filter can't use {term}, because the Action only looks at open pull requests")
+        elif key == "label" and LABEL.lower() in [v.strip('"') for v in value.split(",")]:
+            raise ValueError(f"pr-filter can't use {term}, because the Action searches with and without its own label")
+        else:
+            kept.append(term)
+    return " ".join(kept), dropped
+
+
+def collect(start, end, apply, report, extra=""):
     """Removes the labels that need no judgment and returns the rest, oldest first."""
     # A search stops at SEARCH_LIMIT results, so oldest first lets the next search start from the last result
-    open_prs = f"repo:{REPO_OWNER}/{REPO_NAME} is:pr is:open sort:updated-asc"
+    open_prs = f"repo:{REPO_OWNER}/{REPO_NAME} is:pr is:open sort:updated-asc {extra}".rstrip()
     # Both searches run before any label changes, so that a failed search changes nothing
     found = [(labeled, search_all(q, start)) for labeled, q in ((True, f'{open_prs} label:"{LABEL}"'), (False, f'{open_prs} -label:"{LABEL}"'))]
     todo = []
@@ -411,12 +474,21 @@ def write_state(through, retries):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--since", default=setting("SINCE", ""), help="judge activity after this ISO time, instead of where the last run stopped")
-    ap.add_argument("--apply", action="store_true", default=setting("DRY_RUN", "true") == "false",
+    ap.add_argument("--apply", action="store_true", default=not flag("DRY_RUN", "true"),
                     help="change labels instead of printing what would change")
     ap.add_argument("--dump-prompts", metavar="FILE", help="write the prompts as JSON lines instead of calling the model")
     args = ap.parse_args()
-    if PROVIDER not in ("copilot", "claude"):
-        sys.exit(f"Unknown provider {PROVIDER}: use copilot or claude")
+    if args.since:
+        try:
+            datetime.fromisoformat(args.since.replace("Z", "+00:00"))
+        except ValueError:
+            bad_setting("SINCE", args.since, "an ISO time, such as 2026-11-01T00:00:00Z")
+    try:
+        extra, dropped = pr_filter(PR_FILTER)
+    except ValueError as error:
+        sys.exit(str(error))
+    if dropped:
+        print(f"Leaving {' '.join(dropped)} out of pr-filter, since the Action sets the order, dates and state itself")
 
     # A PR is judged once it has been quiet for QUIET_MINUTES, so the window ends that long ago
     end_time = datetime.now(timezone.utc) - timedelta(minutes=QUIET_MINUTES)
@@ -428,7 +500,7 @@ def main():
 
     report = {"added": [], "removed": [], "judged": 0, "held": 0, "failures": 0, "unusable": 0, "failed_at": [], "usage": Usage()}
     ensure_label(args.apply)
-    todo = collect(start, end, args.apply, report)
+    todo = collect(start, end, args.apply, report, extra)
 
     if args.dump_prompts:
         with open(args.dump_prompts, "w", encoding="utf-8") as dump:
@@ -452,8 +524,11 @@ def main():
             write_state(*progress(todo, done, start, end, report, retries))
 
     if todo:
-        with open_model() as model:
-            judge_all(todo, model, args.apply, report, checkpoint)
+        try:
+            with open_model() as model:
+                judge_all(todo, model, args.apply, report, checkpoint)
+        except (BadSetting, RuntimeError) as error:
+            sys.exit(str(error))
     through, retries = progress(todo, len(todo), start, end, report, retries)
     all_failed = todo and report["failures"] == len(todo)
     # Every PR failing means a token or the model service is broken, unless each failure was an answer that didn't fit
@@ -462,7 +537,7 @@ def main():
     if not keep_place:
         write_state(through, retries)
     if all_failed:
-        sys.exit("Every PR failed")
+        sys.exit("Every PR failed. If this keeps happening, check the token, model and effort")
 
 
 if __name__ == "__main__":

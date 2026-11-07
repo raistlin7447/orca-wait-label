@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -307,6 +308,11 @@ class Search(unittest.TestCase):
     def test_later_runs_start_after_the_last_one(self):
         self.assertTrue(all(f"updated:>={START}" in q for q in self.queries(START)))
 
+    def test_a_filter_narrows_both_searches(self):
+        with mock.patch.object(w, "search", return_value=[]) as search:
+            w.collect(START, END, False, fresh_report(), 'base:main -label:"on hold"')
+        self.assertTrue(all('is:open sort:updated-asc base:main -label:"on hold" ' in c.args[0] for c in search.call_args_list))
+
     def found(self, *numbers, updated="2026-01-02T12:00:00Z"):
         return [pr([ASK], number=n) | {"updatedAt": updated} for n in numbers]
 
@@ -344,11 +350,61 @@ class Search(unittest.TestCase):
         self.assertEqual((report["removed"], report["failed_at"]), ([], ["2026-01-02T02:00:00Z"]))
 
 
+class Filter(unittest.TestCase):
+    def test_keeps_terms_and_quoted_values(self):
+        self.assertEqual(w.pr_filter('base:main -label:"on hold",stale -is:draft fix'),
+                         ('base:main -label:"on hold",stale -is:draft fix', []))
+
+    def test_leaves_out_what_the_action_sets_itself(self):
+        terms = "sort:created-desc updated:>2026-01-01 is:pr IS:OPEN"
+        self.assertEqual(w.pr_filter(f"{terms} base:main"), ("base:main", terms.split()))
+
+    def test_refuses_what_contradicts_the_action(self):
+        for term in ("repo:a/b", "org:a", "is:closed", "is:merged", "-is:open", "type:issue", f'label:x,"{w.LABEL.upper()}"'):
+            with self.subTest(term), self.assertRaises(ValueError):
+                w.pr_filter(f"base:main {term}")
+
+    def test_a_refused_filter_stops_the_run_before_any_search(self):
+        with mock.patch.object(w, "PR_FILTER", "is:closed"), mock.patch.object(w, "collect") as collect, \
+                mock.patch.object(sys, "argv", ["wait_label.py"]), self.assertRaisesRegex(SystemExit, "open pull requests"):
+            w.main()
+        collect.assert_not_called()
+
+
 class Settings(unittest.TestCase):
     def test_an_unset_list_uses_its_default_and_an_empty_one_stays_empty(self):
         self.assertEqual(w.setting_list("NOT_SET", "A,B"), {"A", "B"})
         with mock.patch.dict(os.environ, {"WAIT_LABEL_EMPTY_LIST": ""}):
             self.assertEqual(w.setting_list("EMPTY_LIST", "A,B"), set())
+
+    def test_logins_can_be_written_as_mentions(self):
+        self.assertEqual(w.login_list("NOT_SET", "@Alice, bob"), {"alice", "bob"})
+
+    def stopped(self, call, name, value):
+        with mock.patch.dict(os.environ, {f"WAIT_LABEL_{name}": value}), self.assertRaises(SystemExit) as raised:
+            call()
+        return str(raised.exception)
+
+    def test_bad_values_name_the_input_and_what_it_takes(self):
+        self.assertEqual(self.stopped(lambda: w.choice("PROVIDER", "copilot", ("copilot", "claude")), "PROVIDER", "Claude"),
+                         "provider must be one of copilot, claude, not 'Claude'")
+        self.assertIn("effort must be one of low, medium", self.stopped(lambda: w.choice("EFFORT", "", ("", "low", "medium")), "EFFORT", "huge"))
+        self.assertIn("max-judgments must be a whole number", self.stopped(lambda: w.number("MAX_JUDGMENTS", "20"), "MAX_JUDGMENTS", "ten"))
+        self.assertIn("must be a whole number", self.stopped(lambda: w.number("MAX_JUDGMENTS", "20"), "MAX_JUDGMENTS", "-1"))
+        self.assertIn("label-drafts must be true or false", self.stopped(lambda: w.flag("LABEL_DRAFTS", "false"), "LABEL_DRAFTS", "yes"))
+
+    def test_flags_ignore_case(self):
+        with mock.patch.dict(os.environ, {"WAIT_LABEL_LABEL_DRAFTS": "True"}):
+            self.assertTrue(w.flag("LABEL_DRAFTS", "false"))
+
+    def test_bad_settings_stop_the_run_on_import(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for name, value, message in (("TEAM_ASSOCIATIONS", "OWNER,MEMBERS", "team-associations must be made of OWNER"),
+                                     ("LABEL_COLOR", "yellow", "label-color must be six hex digits")):
+            out = subprocess.run([sys.executable, "-c", "import wait_label"], cwd=root, capture_output=True, text=True,
+                                 env=os.environ | {f"WAIT_LABEL_{name}": value})
+            self.assertEqual(out.returncode, 1)
+            self.assertIn(message, out.stderr)
 
 
 class GitHubCalls(unittest.TestCase):
@@ -433,7 +489,7 @@ class Run(unittest.TestCase):
         fake = mock.MagicMock()
         fake.__enter__.return_value = model or FakeModel(*[False] * 10)
         with mock.patch.object(w, "STATE_FILE", path), mock.patch.object(w, "MAX_JUDGMENTS", 2), \
-                mock.patch.object(w, "collect", side_effect=lambda s, e, a, r: todo) as collect, mock.patch.object(w, "ensure_label"), \
+                mock.patch.object(w, "collect", side_effect=lambda s, e, a, r, x: todo) as collect, mock.patch.object(w, "ensure_label"), \
                 mock.patch.object(w, "open_model", return_value=fake) as open_model, \
                 mock.patch.object(w, "set_label"), mock.patch.object(sys, "argv", ["wait_label.py", *argv]):
             w.main()
@@ -483,10 +539,19 @@ class Run(unittest.TestCase):
         saved, window = self.run_main([(time, i, False, "p") for i in range(3)], ["--apply"], state="2026-01-01T23:59:59Z", model=model)
         self.assertEqual((saved, model.calls), (window[1], 3))
 
-    def test_an_unknown_provider_stops_the_run(self):
-        with mock.patch.object(w, "PROVIDER", "Claude"), self.assertRaises(SystemExit) as stopped:
-            self.run_main([], ["--apply"])
-        self.assertIn("Unknown provider", str(stopped.exception))
+    def test_a_bad_since_names_the_format(self):
+        with self.assertRaisesRegex(SystemExit, "since must be an ISO time"):
+            self.run_main([], ["--since", "last tuesday"])
+
+    def test_a_model_copilot_lacks_stops_the_run_where_it_was(self):
+        fake = mock.MagicMock()
+        fake.__enter__.side_effect = models.BadSetting("model must be one of a, b, not 'c'")
+        with mock.patch.object(w, "open_model", return_value=fake), mock.patch.object(w, "write_state") as write, \
+                mock.patch.object(w, "collect", return_value=[("2026-01-02T00:00:00Z", 1, False, "p")]), \
+                mock.patch.object(w, "ensure_label"), mock.patch.object(sys, "argv", ["wait_label.py"]), \
+                self.assertRaisesRegex(SystemExit, "model must be one of a, b"):
+            w.main()
+        write.assert_not_called()
 
     def test_no_model_is_opened_with_nothing_to_judge(self):
         self.run_main([], ["--apply"])
@@ -611,6 +676,89 @@ class Providers(unittest.TestCase):
             with self.assertRaises(models.UnusableAnswer) as raised:
                 models.ClaudeModel("m", "s", {}).judge("p")
         self.assertNotIn("#5", str(raised.exception))
+
+    def test_copilot_refuses_a_model_it_does_not_offer(self):
+        class Client:
+            def __init__(self, **_):
+                self.stopped = False
+
+            async def start(self):
+                pass
+
+            async def stop(self):
+                self.stopped = True
+
+            async def list_models(self):
+                return [mock.Mock(id="claude-sonnet-5.5"), mock.Mock(id="auto")]
+        with mock.patch.dict(sys.modules, {"copilot": mock.Mock(CopilotClient=Client)}):
+            with self.assertRaisesRegex(models.BadSetting, "model must be one of claude-sonnet-5.5, auto, not 'claude-sonet-5.5'"):
+                models.CopilotModel("claude-sonet-5.5", "s", {}, "t").__enter__()
+            with models.CopilotModel("auto", "s", {}, "t") as model:
+                self.assertFalse(model.client.stopped)
+
+    def answers(self, *bodies):
+        """Fakes the Models API, where None stands for a 404 and a number for another error status."""
+        def respond(request, timeout):
+            self.requests.append(request)
+            body = bodies[len(self.requests) - 1]
+            if body is None or isinstance(body, int):
+                raise urllib.error.HTTPError(request.full_url, body or 404, "x", {}, io.BytesIO(b"denied"))
+            response = mock.MagicMock()
+            response.__enter__.return_value = io.BytesIO(json.dumps(body).encode())
+            return response
+        self.requests = []
+        return mock.patch("urllib.request.urlopen", side_effect=respond)
+
+    EFFORTS = {"supported": True, "low": {"supported": True}, "high": {"supported": True}, "max": {"supported": False}}
+
+    def claude(self, model="claude-sonnet-5-5", effort=""):
+        return models.ClaudeModel(model, "s", {}, effort=effort).__enter__()
+
+    def test_claude_refuses_a_model_anthropic_does_not_offer(self):
+        with self.answers(None, {"data": [{"id": "claude-sonnet-5-5"}, {"id": "claude-opus-5-5"}]}), \
+                self.assertRaisesRegex(models.BadSetting, "model must be one of claude-sonnet-5-5, claude-opus-5-5, or a family such as sonnet, not 'sonet'"):
+            self.claude("sonet")
+        self.assertTrue(self.requests[0].full_url.endswith("/v1/models/sonet"))
+
+    def test_a_claude_family_name_runs_its_newest_model(self):
+        caps = {"effort": self.EFFORTS}
+        family = {"data": [{"id": "claude-sonnet-5", "created_at": "2026-06-29T00:00:00Z", "capabilities": caps},
+                           {"id": "claude-sonnet-5-5", "created_at": "2026-09-28T00:00:00Z", "capabilities": caps},
+                           {"id": "claude-opus-5-5", "created_at": "2026-10-01T00:00:00Z", "capabilities": caps}]}
+        with self.answers(None, family), contextlib.redirect_stdout(io.StringIO()):
+            model = self.claude("Sonnet", "high")
+        self.assertEqual((model.model, model.args[model.args.index("--model") + 1]), ("claude-sonnet-5-5", "claude-sonnet-5-5"))
+
+    def test_claude_checks_effort_against_the_model(self):
+        info = {"id": "claude-sonnet-5-5", "capabilities": {"effort": self.EFFORTS}}
+        with self.answers(info, info, info):
+            self.claude(effort="high")
+            with self.assertRaisesRegex(models.BadSetting, "effort must be one of low, high for claude-sonnet-5-5, not 'max'"):
+                self.claude(effort="max")
+            self.claude()
+        no_effort = {"id": "claude-haiku-4-5", "capabilities": {"effort": {"supported": False}}}
+        with self.answers(no_effort), self.assertRaisesRegex(models.BadSetting, "takes no effort setting"):
+            self.claude("claude-haiku-4-5", "low")
+
+    def test_claude_lookups_use_the_key_or_the_token(self):
+        info = {"id": "m", "capabilities": {"effort": {"supported": False}}}
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "key", "CLAUDE_CODE_OAUTH_TOKEN": "token"}), self.answers(info):
+            self.claude()
+        self.assertEqual(self.requests[0].get_header("X-api-key"), "key")
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "", "CLAUDE_CODE_OAUTH_TOKEN": "token"}), self.answers(info):
+            self.claude()
+        self.assertEqual(self.requests[0].get_header("Authorization"), "Bearer token")
+
+    def test_a_refused_claude_lookup_raises(self):
+        with self.answers(401), self.assertRaisesRegex(RuntimeError, "answered 401"):
+            self.claude()
+
+    def test_copilot_checks_effort_against_the_model(self):
+        model = models.CopilotModel("kimi-k3", "s", {}, "t", effort="medium")
+        with self.assertRaisesRegex(models.BadSetting, "effort must be one of low, high, max for kimi-k3, not 'medium'"):
+            model.check([mock.Mock(id="kimi-k3", supported_reasoning_efforts=["low", "high", "max"])])
+        with self.assertRaisesRegex(models.BadSetting, "takes no effort setting"):
+            model.check([mock.Mock(id="kimi-k3", supported_reasoning_efforts=None)])
 
     def test_claude_errors_raise(self):
         with mock.patch("subprocess.run", return_value=mock.Mock(stdout=json.dumps({"is_error": True, "result": "no"}))):

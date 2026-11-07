@@ -41,6 +41,9 @@ inputs:
   label-drafts:
     description: Whether the label can be added to draft PRs
     default: 'false'
+  pr-filter:
+    description: GitHub search terms that narrow which open PRs get looked at, such as base:main -label:"on hold"
+    default: ''
   team-associations:
     description: Who counts as the team, by GitHub's author association. Empty leaves only team-users
     default: OWNER,MEMBER,COLLABORATOR
@@ -198,6 +201,7 @@ runs:
         WAIT_LABEL_LABEL: ${{ inputs.label }}
         WAIT_LABEL_LABEL_COLOR: ${{ inputs.label-color }}
         WAIT_LABEL_LABEL_DRAFTS: ${{ inputs.label-drafts }}
+        WAIT_LABEL_PR_FILTER: ${{ inputs.pr-filter }}
         WAIT_LABEL_TEAM_ASSOCIATIONS: ${{ inputs.team-associations }}
         WAIT_LABEL_TEAM_USERS: ${{ inputs.team-users }}
         WAIT_LABEL_IGNORED_USERS: ${{ inputs.ignored-users }}
