@@ -14,24 +14,28 @@ import models  # noqa: E402
 import wait_label as w  # noqa: E402
 
 
+def user(login, kind="User"):
+    return {"__typename": kind, "login": login}
+
+
 def comment(login, time, text="text", association="CONTRIBUTOR"):
-    return {"author": {"login": login}, "authorAssociation": association, "createdAt": time, "bodyText": text}
+    return {"author": user(login), "authorAssociation": association, "createdAt": time, "bodyText": text}
 
 
-def commit(time, committer="author", author="author", authored=None):
-    return {"commit": {"authoredDate": authored or time, "committedDate": time, "parents": {"totalCount": 1},
+def commit(time, committer="author", author="author"):
+    return {"commit": {"committedDate": time, "parents": {"totalCount": 1},
                        "author": {"user": {"login": author}}, "committer": {"name": "A Person", "user": {"login": committer}}}}
 
 
-def github_commit(time, author="author", authored=None, parents=1):
-    c = commit(time, author=author, authored=authored)
-    c["commit"]["committer"] = {"name": "GitHub", "user": None}
+def github_commit(time, author="author", parents=1, name="GitHub"):
+    c = commit(time, author=author)
+    c["commit"]["committer"] = {"name": name, "user": None}
     c["commit"]["parents"]["totalCount"] = parents
     return c
 
 
 def pr(comments=(), reviews=(), commits=(), labeled=(), number=1, draft=False):
-    return {"number": number, "title": "A title", "isDraft": draft, "author": {"login": "author"},
+    return {"number": number, "title": "A title", "isDraft": draft, "author": user("author"),
             "comments": {"nodes": list(comments)}, "reviews": {"nodes": list(reviews)}, "commits": {"nodes": list(commits)},
             "labeled": {"nodes": [{"__typename": kind, "createdAt": time, "label": {"name": w.LABEL}} for kind, time in labeled]}}
 
@@ -50,8 +54,8 @@ class Events(unittest.TestCase):
         self.assertEqual(self.logins(p), ["reviewer", "author", "triager"])
 
     def test_skips_bots_and_commands(self):
-        p = pr([comment("renovate[bot]", "2026-01-02T00:00:00Z", association="MEMBER"),
-                comment("coderabbitai", "2026-01-02T00:00:00Z", association="MEMBER"),
+        bot = comment("renovate", "2026-01-02T00:00:00Z", association="MEMBER") | {"author": user("renovate", "Bot")}
+        p = pr([bot, comment("coderabbitai", "2026-01-02T00:00:00Z", association="MEMBER"),
                 comment("author", "2026-01-02T00:00:00Z", "/bot add-label x")])
         self.assertEqual(self.logins(p), [])
 
@@ -60,19 +64,16 @@ class Events(unittest.TestCase):
         self.assertEqual(self.logins(p), ["author"])
 
     def test_update_branch_merge_is_not_the_author_working(self):
-        p = pr(commits=[github_commit("2026-01-02T00:00:00Z", parents=2)])
-        self.assertEqual(self.logins(p), [])
-
-    def test_update_branch_rebase_is_not_the_author_working(self):
-        p = pr(commits=[github_commit("2026-01-02T00:00:00Z", authored="2026-01-01T00:00:00Z")])
-        self.assertEqual(self.logins(p), [])
+        for name in ("GitHub", "GitHub Enterprise"):
+            p = pr(commits=[github_commit("2026-01-02T00:00:00Z", parents=2, name=name)])
+            self.assertEqual(self.logins(p), [])
 
     def test_a_team_members_commit_is_not_the_author(self):
         p = pr(commits=[github_commit("2026-01-02T00:00:00Z", author="reviewer")])
         self.assertEqual(self.logins(p), [])
 
     def test_a_commit_linked_to_no_account_counts_as_the_author(self):
-        for empty in (None, {"user": None}):
+        for empty in (None, {"name": "A Person", "user": None}):
             c = commit("2026-01-02T00:00:00Z")
             c["commit"]["committer"] = c["commit"]["author"] = empty
             self.assertEqual(self.logins(pr(commits=[c])), ["author"])
@@ -89,7 +90,7 @@ class Events(unittest.TestCase):
         self.assertEqual(self.logins(pr([comment("CODERABBITAI", "2026-01-02T00:00:00Z", association="MEMBER")])), [])
 
     def test_review_comments_join_the_review_text(self):
-        review = {"author": {"login": "reviewer"}, "authorAssociation": "MEMBER", "state": "COMMENTED",
+        review = {"author": user("reviewer"), "authorAssociation": "MEMBER", "state": "COMMENTED",
                   "submittedAt": "2026-01-02T00:00:00Z", "bodyText": "", "comments": {"nodes": [{"path": "a.c", "bodyText": "Why?"}]}}
         self.assertEqual(w.events(pr(reviews=[review]))[0][4], "[a.c] Why?")
 
@@ -245,16 +246,25 @@ class Search(unittest.TestCase):
     def test_later_runs_start_after_the_last_one(self):
         self.assertTrue(all(f"updated:>={START}" in q for q in self.queries(START)))
 
-    def test_a_cut_off_search_stops_at_its_last_result(self):
-        cut_off = [pr([ASK], number=i) | {"updatedAt": "2026-01-02T12:00:00Z"} for i in range(3)]
-        with mock.patch.object(w, "search", side_effect=[[], cut_off]), mock.patch.object(w, "SEARCH_LIMIT", 3):
-            _, end = w.collect(START, END, False, fresh_report())
-        self.assertEqual(end, "2026-01-02T12:00:00Z")
+    def found(self, *numbers, updated="2026-01-02T12:00:00Z"):
+        return [pr([ASK], number=n) | {"updatedAt": updated} for n in numbers]
 
-    def test_a_complete_search_keeps_the_end(self):
-        with mock.patch.object(w, "search", return_value=[pr([ASK]) | {"updatedAt": "2026-01-02T12:00:00Z"}]):
-            todo, end = w.collect(START, END, False, fresh_report())
-        self.assertEqual((len(todo), end), (2, END))
+    def test_a_cut_off_search_continues_from_its_last_result(self):
+        later = "2026-01-03T00:00:00Z"
+        with mock.patch.object(w, "search", side_effect=[self.found(1, 2), self.found(2, 3, updated=later), []]) as search, \
+                mock.patch.object(w, "SEARCH_LIMIT", 2):
+            prs = w.search_all("q", "")
+        self.assertEqual([p["number"] for p in prs], [1, 2, 3])
+        self.assertEqual([c.args[0] for c in search.call_args_list], ["q", "q updated:>=2026-01-02T12:00:00Z", f"q updated:>={later}"])
+
+    def test_more_prs_in_one_second_than_a_search_returns_still_ends(self):
+        with mock.patch.object(w, "search", return_value=self.found(1, 2)) as search, mock.patch.object(w, "SEARCH_LIMIT", 2):
+            w.search_all("q", "2026-01-02T12:00:00Z")
+        self.assertEqual(search.call_count, 1)
+
+    def test_a_pr_by_a_bot_is_left_out(self):
+        with mock.patch.object(w, "search", side_effect=[[], [pr([ASK]) | {"author": user("renovate", "Bot")}]]):
+            self.assertEqual(w.collect(START, END, False, fresh_report()), [])
 
 
     def test_a_failed_removal_is_recorded_for_a_retry(self):
@@ -274,9 +284,9 @@ class Settings(unittest.TestCase):
 
 
 class GitHubCalls(unittest.TestCase):
-    def failing(self, tries):
-        with mock.patch("subprocess.run", return_value=mock.Mock(returncode=1, stderr="HTTP 404")) as run, \
-                mock.patch("time.sleep") as sleep, self.assertRaisesRegex(RuntimeError, "HTTP 404"):
+    def failing(self, tries, stderr="HTTP 502"):
+        with mock.patch("subprocess.run", return_value=mock.Mock(returncode=1, stderr=stderr)) as run, \
+                mock.patch("time.sleep") as sleep, self.assertRaisesRegex(RuntimeError, stderr):
             w.gh("api", "x", tries=tries)
         return run.call_count, sleep.call_count
 
@@ -286,12 +296,22 @@ class GitHubCalls(unittest.TestCase):
     def test_no_tries_still_tries_once(self):
         self.assertEqual(self.failing(0), (1, 0))
 
+    def test_a_404_is_not_tried_again(self):
+        self.assertEqual(self.failing(3, "HTTP 404"), (1, 0))
+
 
 class Labels(unittest.TestCase):
     def test_slashes_in_a_label_are_escaped(self):
         with mock.patch.object(w, "LABEL", "status/waiting on author"), mock.patch.object(w, "gh") as gh:
             w.set_label(1, False, True)
-        self.assertTrue(gh.call_args.args[-1].endswith("/labels/status%2Fwaiting%20on%20author"))
+        self.assertTrue(gh.call_args.args[1].endswith("/labels/status%2Fwaiting%20on%20author"))
+
+    def test_a_failed_change_is_not_logged(self):
+        out = io.StringIO()
+        with mock.patch.object(w, "gh", side_effect=RuntimeError("HTTP 500")), contextlib.redirect_stdout(out), \
+                self.assertRaises(RuntimeError):
+            w.set_label(1, True, True)
+        self.assertEqual(out.getvalue(), "")
 
 
 class EnsureLabel(unittest.TestCase):
@@ -339,7 +359,7 @@ class Run(unittest.TestCase):
         fake = mock.MagicMock()
         fake.__enter__.return_value = model or FakeModel(*[False] * 10)
         with mock.patch.object(w, "STATE_FILE", path), mock.patch.object(w, "MAX_JUDGMENTS", 2), \
-                mock.patch.object(w, "collect", side_effect=lambda s, e, a, r: (todo, e)) as collect, mock.patch.object(w, "ensure_label"), \
+                mock.patch.object(w, "collect", side_effect=lambda s, e, a, r: todo) as collect, mock.patch.object(w, "ensure_label"), \
                 mock.patch.object(w, "open_model", return_value=fake) as open_model, \
                 mock.patch.object(w, "set_label"), mock.patch.object(sys, "argv", ["wait_label.py", *argv]):
             w.main()
@@ -434,6 +454,16 @@ class Run(unittest.TestCase):
         with mock.patch.object(w, "write_state") as write:
             self.run_main(todo, ["--apply"], state=START)
         self.assertEqual(write.call_args_list[0].args, ("2026-01-02T11:59:59Z", 0))
+
+    def test_a_state_file_can_be_a_bare_name(self):
+        cwd = os.getcwd()
+        os.chdir(tempfile.mkdtemp())
+        try:
+            with mock.patch.object(w, "STATE_FILE", "state.json"):
+                w.write_state(START, 0)
+                self.assertEqual(w.read_state(), (START, 0))
+        finally:
+            os.chdir(cwd)
 
     def test_a_state_file_without_retries_still_reads(self):
         path = os.path.join(tempfile.mkdtemp(), "state.json")

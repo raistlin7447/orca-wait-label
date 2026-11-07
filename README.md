@@ -112,7 +112,9 @@ jobs:
 
 The first runs work through every open PR, oldest first, 20 PRs at a time, and later runs only look at new activity. The `held` count in the log shows how many are left. An hourly schedule gets through about 480 PRs a day, and you can run the workflow by hand or raise `max-judgments` to go faster. Raise `timeout-minutes` along with it. Dry runs and real runs keep separate progress, so the first real run starts again from the oldest PR.
 
-Progress is saved in the Actions cache, and GitHub removes a cache that goes unused for 7 days. A run with no saved progress works through every open PR again, which spends credits again. Set `lookback-hours` to limit how far back it goes.
+Progress is saved in the Actions cache, and GitHub removes a cache that goes unused for 7 days. A run with no saved progress works through every open PR again, which spends credits again. Set `lookback-hours` to limit how far back it goes. Each run adds one small entry to the repository's Caches page.
+
+Until the backlog is done, each run reads every PR left in it, at about 5 GraphQL points per 20 PRs. `GITHUB_TOKEN` gets 1,000 points an hour per repository, shared with your other workflows, so a large backlog on a frequent schedule can reach the limit. That run fails and keeps its place, and a later run carries on. A personal token in `github-token` gets 5,000 points an hour.
 
 The Action needs a Linux or macOS runner with `gh` and `python3`, plus `pip` and Python 3.11 or newer for Copilot, or `npm` for Claude. `ubuntu-latest` has them all. It hasn't been tested on GitHub Enterprise Server.
 
@@ -127,7 +129,7 @@ Model names differ between providers, such as `claude-sonnet-5.5` on Copilot and
 Each run looks at open PRs with new activity from the PR author or a team member. Bots are ignored. A PR is judged once its conversation has been quiet for 30 minutes (by default), so a quick back-and-forth is judged once, at the end.
 
 - A PR without the label is skipped until a team member has spoken, which costs no model call.
-- A commit by the author dated after the label was added removes it, however late it was pushed. GitHub doesn't report push times, so a commit made before the label and pushed after it isn't noticed. A commit from an email linked to no GitHub account counts as the author's. GitHub's "Update branch" and "Sync fork" buttons don't count, because they don't answer a review.
+- A commit by the author dated after the label was added removes it, however late it was pushed. GitHub doesn't report push times, so a commit made before the label and pushed after it isn't noticed. A commit from an email linked to no GitHub account counts as the author's. Merges made by GitHub's "Update branch" and "Sync fork" buttons don't count, because they don't answer a review. A rebase with "Update branch" counts like any rebase by the author, and so does a merge the author makes locally.
 - Otherwise the model reads the last few messages and decides whether the review is waiting on the PR author, and the label is set to match.
 - A "waiting" answer has to come back three times in a row (by default). If the calls disagree, the PR counts as not waiting, because a wrong label takes a PR out of your review queue.
 - A label change made after the latest activity, by a person or by this Action, is left alone until there is new activity.
@@ -153,7 +155,7 @@ Each run looks at open PRs with new activity from the PR author or a team member
 | `label-drafts` | `false` | Whether the label can be added to draft PRs |
 | `team-associations` | `OWNER,MEMBER,COLLABORATOR` | Who counts as the team, by GitHub's author association. Empty leaves only `team-users` |
 | `team-users` | | Comma-separated logins that also count as the team |
-| `ignored-users` | `github-actions,copilot-pull-request-reviewer,Copilot,coderabbitai,dependabot` | Accounts whose comments are ignored, besides any `[bot]` account. Empty ignores no others |
+| `ignored-users` | `github-actions,copilot-pull-request-reviewer,Copilot,coderabbitai,dependabot` | Accounts ignored as well as GitHub's bot accounts. Empty ignores no others |
 | `command-prefix` | | Comments starting with this are commands to another bot, not conversation |
 | `model` | `claude-sonnet-5-5` for `claude`, Copilot's pick for `copilot` | The model that judges |
 | `confirmations` | `2` | Extra calls that must agree before a "waiting" answer stands |

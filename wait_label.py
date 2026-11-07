@@ -78,13 +78,13 @@ STAMP = "%Y-%m-%dT%H:%M:%SZ"
 SEARCH_LIMIT = 1000
 
 PR_FIELDS = """
-  number title isDraft updatedAt author { login }
+  number title isDraft updatedAt author { __typename login }
   labeled: timelineItems(last: %(label_events)d, itemTypes: [LABELED_EVENT, UNLABELED_EVENT]) { nodes { __typename
     ... on LabeledEvent { createdAt label { name } } ... on UnlabeledEvent { createdAt label { name } } } }
-  comments(last: %(comments)d) { nodes { author { login } authorAssociation createdAt bodyText } }
-  reviews(last: %(reviews)d) { nodes { author { login } authorAssociation state submittedAt bodyText
+  comments(last: %(comments)d) { nodes { author { __typename login } authorAssociation createdAt bodyText } }
+  reviews(last: %(reviews)d) { nodes { author { __typename login } authorAssociation state submittedAt bodyText
                               comments(first: %(review_comments)d) { nodes { path bodyText } } } }
-  commits(last: %(commits)d) { nodes { commit { authoredDate committedDate parents { totalCount } author { user { login } } committer { name user { login } } } } }
+  commits(last: %(commits)d) { nodes { commit { committedDate parents { totalCount } author { user { login } } committer { name user { login } } } } }
 """ % {"label_events": MAX_LABEL_EVENTS, "comments": MAX_COMMENTS, "reviews": MAX_REVIEWS,
        "review_comments": MAX_REVIEW_COMMENTS, "commits": MAX_COMMITS}
 QUERY = """
@@ -136,6 +136,8 @@ def gh(*args, tries=GITHUB_TRIES):
         out = subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8")
         if out.returncode == 0:
             return out.stdout
+        if "HTTP 404" in out.stderr:
+            break
         if attempt < tries:
             time.sleep(GITHUB_RETRY_DELAY)
     raise RuntimeError(f"gh {args[0]} {args[1]} failed: {out.stderr.strip()}")
@@ -154,8 +156,21 @@ def search(q):
         cursor = page["pageInfo"]["endCursor"]
 
 
-def is_bot(login):
-    return login is None or login.lower() in IGNORED_USERS or login.endswith("[bot]")
+def search_all(q, start):
+    """Every PR updated since start, however many searches that takes."""
+    prs = {}
+    while True:
+        found = search(q + (f" updated:>={start}" if start else ""))
+        prs.update((p["number"], p) for p in found)
+        # More PRs in one second than a search returns would otherwise never get past that second
+        if len(found) < SEARCH_LIMIT or found[-1]["updatedAt"] == start:
+            return list(prs.values())
+        start = found[-1]["updatedAt"]
+
+
+def is_bot(actor):
+    # A deleted account has no actor
+    return not actor or actor["__typename"] == "Bot" or actor["login"].lower() in IGNORED_USERS
 
 
 def commit_login(actor):
@@ -167,21 +182,19 @@ def events(pr):
     author = pr["author"]["login"]
     out = []
     for c in pr["comments"]["nodes"]:
-        login = (c["author"] or {}).get("login")
-        if not is_bot(login) and not (COMMAND_PREFIX and c["bodyText"].lstrip().startswith(COMMAND_PREFIX)):
-            out.append((c["createdAt"], login, c["authorAssociation"], "comment", c["bodyText"]))
+        if not is_bot(c["author"]) and not (COMMAND_PREFIX and c["bodyText"].lstrip().startswith(COMMAND_PREFIX)):
+            out.append((c["createdAt"], c["author"]["login"], c["authorAssociation"], "comment", c["bodyText"]))
     for r in pr["reviews"]["nodes"]:
-        login = (r["author"] or {}).get("login")
-        if is_bot(login) or not r["submittedAt"]:
+        if is_bot(r["author"]) or not r["submittedAt"]:
             continue
         text = "\n".join([r["bodyText"]] + [f"[{c['path']}] {c['bodyText']}" for c in r["comments"]["nodes"]]).strip()
-        out.append((r["submittedAt"], login, r["authorAssociation"], "review " + r["state"], text))
+        out.append((r["submittedAt"], r["author"]["login"], r["authorAssociation"], "review " + r["state"], text))
     for c in pr["commits"]["nodes"]:
         c = c["commit"]
         committer, writer = commit_login(c["committer"]), commit_login(c["author"])
-        # GitHub's own commits link no committer account; "Update branch" makes merges, or rebases that keep the old authored date
-        by_github = committer is None and (c["committer"] or {}).get("name") == "GitHub"
-        web_edit = by_github and writer == author and c["parents"]["totalCount"] == 1 and c["authoredDate"] == c["committedDate"]
+        # GitHub links no account to the commits it makes, such as web edits and "Update branch" merges
+        by_github = committer is None and (c["committer"] or {}).get("name") in ("GitHub", "GitHub Enterprise")
+        web_edit = by_github and writer == author and c["parents"]["totalCount"] == 1
         # An email linked to no account names nobody, and the PR author is the likeliest to have pushed it
         unlinked = committer is None and not by_github and writer in (None, author)
         if committer == author or web_edit or unlinked:
@@ -203,9 +216,9 @@ def decide(pr, labeled, start, end):
     # A label change after the latest activity, by a person or by this bot, already settled it
     if label_changed(pr) > evs[-1][0]:
         return None
+    labeled_at = label_changed(pr, ("LabeledEvent",))
     # A commit can be pushed long after its date, so start doesn't apply to it
     # Other labels' events can push this label's out of the fetched history, which leaves labeled_at empty
-    labeled_at = label_changed(pr, ("LabeledEvent",))
     if labeled and labeled_at and any(e[1] == author and e[3] == "commit" and e[0] > labeled_at for e in evs):
         return "remove"
     if evs[-1][0] <= start:
@@ -217,9 +230,9 @@ def decide(pr, labeled, start, end):
     return None if pr["isDraft"] and not labeled and not LABEL_DRAFTS else "judge"
 
 
-def prompt_for(pr, evs=None):
+def prompt_for(pr):
     lines = [f"PR #{pr['number']}: {pr['title']}", f"PR author: @{pr['author']['login']}", "", "Recent messages, oldest first:"]
-    evs = evs or events(pr)
+    evs = events(pr)
     for t, login, _, kind, text in evs[max(len(evs) - CONTEXT_MESSAGES, 0):]:
         who = "PR author" if login == pr["author"]["login"] else "team member"
         body = "(pushed commits)" if kind == "commit" else (text[:MAX_TEXT] or "(no text)")
@@ -236,43 +249,38 @@ def open_model():
 def ensure_label(apply):
     path = f"repos/{REPO_OWNER}/{REPO_NAME}/labels"
     try:
-        gh("api", f"{path}/{quote(LABEL, safe='')}", tries=1)
+        gh("api", f"{path}/{quote(LABEL, safe='')}")
     except RuntimeError as error:
         if "HTTP 404" not in str(error):
             raise
         if apply:
-            gh("api", "-X", "POST", path, "-f", f"name={LABEL}", "-f", f"color={LABEL_COLOR}", tries=1)
+            gh("api", path, "-X", "POST", "-f", f"name={LABEL}", "-f", f"color={LABEL_COLOR}", tries=1)
         else:
             print(f"Label '{LABEL}' doesn't exist, so a real run will create it")
 
 
 def set_label(number, add, apply):
-    print(f"{'ADD' if add else 'REMOVE'} #{number}" + ("" if apply else " (dry run)"))
-    if not apply:
-        return
     path = f"repos/{REPO_OWNER}/{REPO_NAME}/issues/{number}/labels"
     try:
-        if add:
-            gh("api", "-X", "POST", path, "-f", f"labels[]={LABEL}", tries=1)
-        else:
-            gh("api", "-X", "DELETE", f"{path}/{quote(LABEL, safe='')}", tries=1)
+        if apply and add:
+            gh("api", path, "-X", "POST", "-f", f"labels[]={LABEL}", tries=1)
+        elif apply:
+            gh("api", f"{path}/{quote(LABEL, safe='')}", "-X", "DELETE", tries=1)
     except RuntimeError as error:
         # Someone removed it by hand since the search
         if add or "HTTP 404" not in str(error):
             raise
+    print(f"{'ADD' if add else 'REMOVE'} #{number}" + ("" if apply else " (dry run)"))
 
 
 def collect(start, end, apply, report):
-    """Removes the labels that need no judgment and returns the rest, oldest first, with the time they cover up to."""
-    # A search stops at 1000 results, so oldest first lets later runs reach the rest
-    open_prs = f"repo:{REPO_OWNER}/{REPO_NAME} is:pr is:open sort:updated-asc" + (f" updated:>={start}" if start else "")
-    found = [(labeled, search(q)) for labeled, q in ((True, f'{open_prs} label:"{LABEL}"'), (False, f'{open_prs} -label:"{LABEL}"'))]
-    # A search that was cut off says nothing about PRs past its last result
-    end = min([end] + [prs[-1]["updatedAt"] for _, prs in found if len(prs) >= SEARCH_LIMIT])
+    """Removes the labels that need no judgment and returns the rest, oldest first."""
+    # A search stops at SEARCH_LIMIT results, so oldest first lets the next search start from the last result
+    open_prs = f"repo:{REPO_OWNER}/{REPO_NAME} is:pr is:open sort:updated-asc"
     todo = []
-    for labeled, prs in found:
-        for pr in prs:
-            if is_bot((pr["author"] or {}).get("login")):
+    for labeled, q in ((True, f'{open_prs} label:"{LABEL}"'), (False, f'{open_prs} -label:"{LABEL}"')):
+        for pr in search_all(q, start):
+            if is_bot(pr["author"]):
                 continue
             action = decide(pr, labeled, start, end)
             if action == "remove":
@@ -284,7 +292,7 @@ def collect(start, end, apply, report):
                     report["failed_at"].append(events(pr)[-1][0])
             elif action == "judge":
                 todo.append((events(pr)[-1][0], pr["number"], labeled, prompt_for(pr)))
-    return sorted(todo), end
+    return sorted(todo)
 
 
 def judge(model, prompt, usage):
@@ -359,7 +367,7 @@ def read_state():
 
 def write_state(through, retries):
     if STATE_FILE:
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
         # A run cancelled partway through a write must not leave a broken file
         with open(STATE_FILE + ".tmp", "w", encoding="utf-8") as state:
             json.dump({"judged_through": through, "retries": retries}, state)
@@ -386,7 +394,7 @@ def main():
 
     report = {"added": [], "removed": [], "judged": 0, "held": 0, "failures": 0, "failed_at": [], "usage": Usage()}
     ensure_label(args.apply)
-    todo, end = collect(start, end, args.apply, report)
+    todo = collect(start, end, args.apply, report)
 
     if args.dump_prompts:
         with open(args.dump_prompts, "w", encoding="utf-8") as dump:

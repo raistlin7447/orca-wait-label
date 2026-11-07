@@ -48,7 +48,7 @@ inputs:
     description: Comma-separated logins that also count as the team
     default: ''
   ignored-users:
-    description: Accounts whose comments are ignored, besides any [bot] account. Empty ignores no others
+    description: Accounts ignored as well as GitHub's bot accounts. Empty ignores no others
     default: github-actions,copilot-pull-request-reviewer,Copilot,coderabbitai,dependabot
   command-prefix:
     description: Comments starting with this are commands to another bot, not conversation
