@@ -107,6 +107,12 @@ class Events(unittest.TestCase):
         p = pr(commits=[commit("2027-01-01T00:00:00Z", pushed="2026-01-02T00:00:00Z")])
         self.assertEqual(w.events(p)[0][0], "2026-01-02T00:00:00Z")
 
+    def test_a_commit_without_checks_does_not_take_a_merges_checks(self):
+        merge = github_commit("2026-01-03T00:00:00Z", parents=2)
+        merge["commit"]["checkSuites"]["nodes"] = [{"createdAt": "2026-01-03T00:00:00Z"}]
+        p = pr(commits=[commit("2026-01-02T00:00:00Z"), merge])
+        self.assertEqual(w.events(p)[0][0], "2026-01-02T00:00:00Z")
+
     def test_commits_pushed_together_count_once_from_the_push(self):
         p = pr(commits=[commit("2026-01-01T00:00:00Z", pushed="2026-01-01T01:00:00Z"), commit("2026-01-02T00:00:00Z"),
                         commit("2026-01-02T01:00:00Z", pushed="2026-01-02T05:00:00Z")])
@@ -237,6 +243,13 @@ class Judging(unittest.TestCase):
         self.assertFalse(w.judge(model, "p", models.Usage())["waiting_on_author"])
         self.assertEqual(model.calls, 2)
 
+    def test_an_answer_without_a_verdict_is_unusable(self):
+        class Rambling(FakeModel):
+            def judge(self, prompt):
+                return {"reason": "r"}, models.Usage()
+        with self.assertRaises(models.UnusableAnswer):
+            w.judge(Rambling(), "p", models.Usage())
+
     def test_not_waiting_needs_one_call(self):
         model = FakeModel(False)
         w.judge(model, "p", models.Usage())
@@ -350,6 +363,11 @@ class GitHubCalls(unittest.TestCase):
 
     def test_no_tries_still_tries_once(self):
         self.assertEqual(self.failing(0), (1, 0))
+
+    def test_a_refused_search_names_the_permissions(self):
+        with mock.patch.object(w, "gh", side_effect=RuntimeError("Resource not accessible by integration")), \
+                self.assertRaisesRegex(RuntimeError, "checks: read"):
+            w.search("q")
 
     def test_a_404_is_not_tried_again(self):
         self.assertEqual(self.failing(3, "HTTP 404"), (1, 0))
@@ -482,7 +500,7 @@ class Run(unittest.TestCase):
             self.run_main(todo, ["--apply"], model=Broken())
         write.assert_not_called()
 
-    def test_a_single_failing_pr_keeps_the_place(self):
+    def test_a_model_service_error_on_the_only_pr_keeps_the_place(self):
         out = io.StringIO()
         with mock.patch.object(w, "write_state") as write, self.assertRaises(SystemExit), contextlib.redirect_stdout(out):
             self.run_main([("2026-01-02T00:00:00Z", 2, False, "bad")], ["--apply"], state=START, model=self.FailsOnBad())
@@ -492,7 +510,7 @@ class Run(unittest.TestCase):
     def test_an_answer_that_does_not_fit_uses_up_a_retry(self):
         class Unusable(FakeModel):
             def judge(self, prompt):
-                raise ValueError("Expecting value")
+                raise models.UnusableAnswer("the answer isn't JSON")
         with mock.patch.object(w, "write_state") as write, self.assertRaises(SystemExit):
             self.run_main([("2026-01-02T00:00:00Z", 2, False, "p")], ["--apply"], state=START, model=Unusable())
         write.assert_called_once_with("2026-01-01T23:59:59Z", 1)
@@ -586,6 +604,12 @@ class Providers(unittest.TestCase):
         with mock.patch("subprocess.run", return_value=mock.Mock(stdout="", stderr="Invalid token\n", returncode=1)):
             with self.assertRaisesRegex(RuntimeError, "Invalid token"):
                 models.ClaudeModel("m", "s", {}).judge("p")
+
+    def test_a_claude_answer_that_is_not_json_is_unusable_and_kept_out_of_the_error(self):
+        with mock.patch("subprocess.run", return_value=mock.Mock(stdout=json.dumps({"result": "The author of #5 is slow"}))):
+            with self.assertRaises(models.UnusableAnswer) as raised:
+                models.ClaudeModel("m", "s", {}).judge("p")
+        self.assertNotIn("#5", str(raised.exception))
 
     def test_claude_errors_raise(self):
         with mock.patch("subprocess.run", return_value=mock.Mock(stdout=json.dumps({"is_error": True, "result": "no"}))):

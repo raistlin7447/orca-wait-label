@@ -21,8 +21,20 @@ class Usage:
             setattr(self, field, getattr(self, field) + getattr(other, field))
 
 
-CLAUDE_TOKENS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
+class UnusableAnswer(Exception):
+    """The model answered, but not with a verdict the bot can read."""
+
+
+CLAUDE_TOKENS =("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
 SECRET_WORDS = ("TOKEN", "SECRET", "PASSWORD", "KEY")
+
+
+def answer_json(text):
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        # The text is the model's view of a named contributor's PR, so it stays out of the log
+        raise UnusableAnswer("the answer isn't JSON") from None
 
 
 def model_env(keep=()):
@@ -59,7 +71,7 @@ class ClaudeModel:
             raise RuntimeError(result.get("result"))
         usage = result.get("usage", {})
         tokens = sum(usage.get(k, 0) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
-        return (result.get("structured_output") or json.loads(result["result"]),
+        return (result.get("structured_output") or answer_json(result["result"]),
                 Usage(1, tokens, usage.get("output_tokens", 0), cost_usd=result.get("total_cost_usd", 0.0)))
 
 
@@ -90,7 +102,7 @@ class CopilotModel:
         try:
             reply = await session.send_and_wait(prompt, response_schema=self.schema, timeout=self.timeout)
             metrics = await session.rpc.usage.get_metrics()
-            return (json.loads(reply.data.content),
+            return (answer_json(reply.data.content),
                     Usage(1, metrics.last_call_input_tokens, metrics.last_call_output_tokens,
                           ai_credits=(metrics.total_nano_aiu or 0) / 1e9))
         finally:

@@ -18,7 +18,7 @@ inputs:
     description: Anthropic API key, instead of claude-code-oauth-token
     default: ''
   github-token:
-    description: Token that can read PRs and change labels on the target repository
+    description: Token that can read PRs and their checks and change labels on the target repository. The workflow token needs pull-requests write and checks read
     default: ${{ github.token }}
   repository:
     description: The repository whose PRs get the label, as owner/name

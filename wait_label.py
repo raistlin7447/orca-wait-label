@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
-from models import ClaudeModel, CopilotModel, Usage
+from models import ClaudeModel, CopilotModel, UnusableAnswer, Usage
 
 
 def setting(name, default):
@@ -150,7 +150,12 @@ def search(q):
         args = ["api", "graphql", "-f", f"query={QUERY}", "-f", f"q={q}"]
         if cursor:
             args += ["-f", f"endCursor={cursor}"]
-        page = json.loads(gh(*args))["data"]["search"]
+        try:
+            page = json.loads(gh(*args))["data"]["search"]
+        except RuntimeError as error:
+            if "Resource not accessible" not in str(error):
+                raise
+            raise RuntimeError(f"{error}. The token needs to read pull requests and checks, such as with checks: read") from None
         prs += [p for p in page["nodes"] if p]
         if not page["pageInfo"]["hasNextPage"]:
             return prs
@@ -197,16 +202,18 @@ def events(pr):
     pushes, pushed = set(), None
     for c in reversed(pr["commits"]["nodes"]):
         c = c["commit"]
-        # A push starts checks on its last commit, so the earliest checks on this commit or a later one date its push
-        pushed = min([s["createdAt"] for s in c["checkSuites"]["nodes"]] + ([pushed] if pushed else []), default=None)
         committer, writer = commit_login(c["committer"]), commit_login(c["author"])
         # GitHub links no account to the commits it makes, such as web edits and "Update branch" merges
         by_github = committer is None and (c["committer"] or {}).get("name") in ("GitHub", "GitHub Enterprise")
         web_edit = by_github and writer == author and c["parents"]["totalCount"] == 1
         # An email linked to no account names nobody, and the PR author is the likeliest to have pushed it
         unlinked = committer is None and not by_github and writer in (None, author)
+        if not (committer == author or web_edit or unlinked):
+            continue
+        # A push starts checks on its last commit, so a commit without checks was pushed with the author's next one that has them
+        pushed = min((s["createdAt"] for s in c["checkSuites"]["nodes"]), default=pushed)
         # Without checks only the commit's own date is known, and a date after the PR's last update comes from a wrong clock
-        if (committer == author or web_edit or unlinked) and (pushed or c["committedDate"] <= pr["updatedAt"]):
+        if pushed or c["committedDate"] <= pr["updatedAt"]:
             pushes.add(pushed or c["committedDate"])
     out += [(t, author, "", "commit", "") for t in pushes]
     return sorted(e for e in out if e[1] == author or e[2] in TEAM or e[1].lower() in TEAM_USERS)
@@ -308,13 +315,19 @@ def collect(start, end, apply, report):
     return sorted(todo)
 
 
-def judge(model, prompt, usage):
+def ask(model, prompt, usage):
     verdict, used = model.judge(prompt)
     usage.add(used)
+    if not isinstance(verdict, dict) or not isinstance(verdict.get("waiting_on_author"), bool):
+        raise UnusableAnswer("the answer has no waiting_on_author verdict")
+    return verdict
+
+
+def judge(model, prompt, usage):
+    verdict = ask(model, prompt, usage)
     # "Waiting" hides the PR from the review queue, so it has to hold on every try
     for _ in range(CONFIRMATIONS if verdict["waiting_on_author"] else 0):
-        again, used = model.judge(prompt)
-        usage.add(used)
+        again = ask(model, prompt, usage)
         if not again["waiting_on_author"]:
             return again
     return verdict
@@ -328,8 +341,8 @@ def judge_all(todo, model, apply, report, checkpoint=lambda done: None):
             print(f"::warning::Cannot judge #{number}: {one_line(error)}")
             report["failures"] += 1
             report["failed_at"].append(when)
-            # An answer that doesn't fit the schema comes from this PR, while other errors come from the model service
-            report["unusable"] += isinstance(error, (ValueError, KeyError, TypeError))
+            # An answer the bot can't read comes from this PR, while other errors come from the model service
+            report["unusable"] += isinstance(error, UnusableAnswer)
         else:
             report["judged"] += 1
             # Off by default because a public Actions log would show the model's judgment of each named contributor's PR

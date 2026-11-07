@@ -25,6 +25,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  checks: read
 
 concurrency:
   group: waiting-on-author
@@ -56,6 +57,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  checks: read
   copilot-requests: write
 
 concurrency:
@@ -88,6 +90,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  checks: read
 
 concurrency:
   group: waiting-on-author
@@ -145,7 +148,7 @@ Each run looks at open PRs with new activity from the PR author or a team member
 | `copilot-token` | (`github-token`) | Token for Copilot |
 | `claude-code-oauth-token` | | Token from `claude setup-token` |
 | `anthropic-api-key` | | Anthropic API key, instead of the OAuth token |
-| `github-token` | `github.token` | Token that can read PRs and change labels |
+| `github-token` | `github.token` | Token that can read PRs and their checks and change labels. A fine-grained token needs the Pull requests (write) and Checks (read) permissions |
 | `repository` | this repository | The repository whose PRs get the label |
 | `dry-run` | `true` | Only log what would change |
 | `since` | | Judge activity after this ISO time, instead of where the last run stopped |
@@ -212,7 +215,7 @@ To close PRs that never get a reply, point [`actions/stale`](https://github.com/
 
 ## Reliability
 
-We built 200 cases from the history of open PRs in one repository, and compared Sonnet 5.5 with reference judgments, using the same call the Action makes and requiring three calls to agree. It said "waiting" on 3 cases where the reference did not, and missed 1 of 76 clear waits. The Claude CLI and the Copilot SDK scored the same. The cases and judgments aren't published, because they're about named contributors' PRs. No Free plan account has been tested, so start with a dry run on your repository.
+We built 200 cases from the history of open PRs in one repository, and compared Sonnet 5.5 with reference judgments, using the same call the Action makes and requiring three calls to agree. That prompt listed each commit by its own date, where the Action now lists each push. It said "waiting" on 3 cases where the reference did not, and missed 1 of 76 clear waits. The Claude CLI and the Copilot SDK scored the same. The cases and judgments aren't published, because they're about named contributors' PRs. No Free plan account has been tested, so start with a dry run on your repository.
 
 ## Running locally
 
