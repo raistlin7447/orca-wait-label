@@ -346,7 +346,7 @@ def pr_filter(text):
             raise ValueError(f"pr-filter can't use {term}, because the repository input sets the repository")
         elif state in (OPEN_PRS if negated else OTHER_STATES):
             raise ValueError(f"pr-filter can't use {term}, because the Action only looks at open pull requests")
-        elif key == "label" and LABEL.lower() in [v.strip('"') for v in value.split(",")]:
+        elif state == "no:label" or (key == "label" and LABEL.lower() in [v.strip('"') for v in value.split(",")]):
             raise ValueError(f"pr-filter can't use {term}, because the Action searches with and without its own label")
         else:
             kept.append(term)

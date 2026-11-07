@@ -360,7 +360,7 @@ class Filter(unittest.TestCase):
         self.assertEqual(w.pr_filter(f"{terms} base:main"), ("base:main", terms.split()))
 
     def test_refuses_what_contradicts_the_action(self):
-        for term in ("repo:a/b", "org:a", "is:closed", "is:merged", "-is:open", "type:issue", f'label:x,"{w.LABEL.upper()}"'):
+        for term in ("repo:a/b", "org:a", "is:closed", "is:merged", "-is:open", "type:issue", "no:label", f'label:x,"{w.LABEL.upper()}"'):
             with self.subTest(term), self.assertRaises(ValueError):
                 w.pr_filter(f"base:main {term}")
 
@@ -700,7 +700,9 @@ class Providers(unittest.TestCase):
         """Fakes the Models API, where None stands for a 404 and a number for another error status."""
         def respond(request, timeout):
             self.requests.append(request)
-            body = bodies[len(self.requests) - 1]
+            body = bodies[min(len(self.requests), len(bodies)) - 1]
+            if isinstance(body, Exception):
+                raise body
             if body is None or isinstance(body, int):
                 raise urllib.error.HTTPError(request.full_url, body or 404, "x", {}, io.BytesIO(b"denied"))
             response = mock.MagicMock()
@@ -752,6 +754,44 @@ class Providers(unittest.TestCase):
     def test_a_refused_claude_lookup_raises(self):
         with self.answers(401), self.assertRaisesRegex(RuntimeError, "answered 401"):
             self.claude()
+        self.assertEqual(len(self.requests), 1)
+
+    def test_a_busy_or_unreachable_model_list_is_tried_again(self):
+        info = {"id": "m", "capabilities": {"effort": {"supported": False}}}
+        with self.answers(503, info), mock.patch("time.sleep") as sleep:
+            self.claude()
+        self.assertEqual((len(self.requests), sleep.call_count), (2, 1))
+        with self.answers(urllib.error.URLError("no route")), mock.patch("time.sleep"), \
+                self.assertRaisesRegex(RuntimeError, "couldn't be reached"):
+            self.claude()
+        self.assertEqual(len(self.requests), models.LOOKUP_TRIES)
+
+    def test_a_gateway_without_a_model_list_skips_the_check(self):
+        out = io.StringIO()
+        with self.answers(None, None), contextlib.redirect_stdout(out):
+            model = self.claude("sonnet", "high")
+        self.assertEqual(model.model, "sonnet")
+        self.assertIn("unchecked", out.getvalue())
+
+    def test_a_failed_copilot_model_list_stops_the_client(self):
+        class Client:
+            stopped = False
+
+            def __init__(self, **_):
+                pass
+
+            async def start(self):
+                pass
+
+            async def stop(self):
+                Client.stopped = True
+
+            async def list_models(self):
+                raise ConnectionError("denied")
+        with mock.patch.dict(sys.modules, {"copilot": mock.Mock(CopilotClient=Client)}), \
+                self.assertRaisesRegex(RuntimeError, "Copilot's model list failed: denied"):
+            models.CopilotModel("auto", "s", {}, "t").__enter__()
+        self.assertTrue(Client.stopped)
 
     def test_copilot_checks_effort_against_the_model(self):
         model = models.CopilotModel("kimi-k3", "s", {}, "t", effort="medium")

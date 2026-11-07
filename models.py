@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ class UnusableAnswer(Exception):
 
 
 CLAUDE_TOKENS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
+LOOKUP_TRIES, LOOKUP_RETRY_DELAY = 3, 10
 SECRET_WORDS = ("TOKEN", "SECRET", "PASSWORD", "KEY")
 
 
@@ -61,14 +63,23 @@ def model_env(keep=()):
 class ClaudeModel:
     def __init__(self, model, system_prompt, schema, binary="claude", timeout=300, effort=""):
         self.model, self.effort, self.timeout = model, effort, timeout
-        self.args = [binary, "-p", "--tools", "", "--strict-mcp-config", "--setting-sources", "",
-                     "--no-session-persistence", "--model", model, "--system-prompt", system_prompt,
-                     "--json-schema", json.dumps(schema), "--output-format", "json"] + (["--effort", effort] if effort else [])
+        self.binary, self.system_prompt, self.schema = binary, system_prompt, schema
+
+    @property
+    def args(self):
+        return [self.binary, "-p", "--tools", "", "--strict-mcp-config", "--setting-sources", "",
+                "--no-session-persistence", "--model", self.model, "--system-prompt", self.system_prompt,
+                "--json-schema", json.dumps(self.schema), "--output-format", "json"] + (["--effort", self.effort] if self.effort else [])
 
     def __enter__(self):
         info = self.lookup(f"/v1/models/{quote(self.model, safe='')}")
         if info is None:
-            available = self.lookup("/v1/models?limit=1000")["data"]
+            listing = self.lookup("/v1/models?limit=1000")
+            # A gateway set with ANTHROPIC_BASE_URL may not list models at all
+            if listing is None:
+                print("The model list isn't available, so model and effort go to Claude unchecked")
+                return self
+            available = listing["data"]
             # A family name such as sonnet means its newest model, as in claude-sonnet-5-5
             family = [m for m in available if m["id"].split("-")[1:2] == [self.model.lower()]]
             if not family:
@@ -76,7 +87,7 @@ class ClaudeModel:
             info = max(family, key=lambda m: m["created_at"])
             print(f"Using {info['id']} for model {self.model}")
             # The CLI gets the full ID, so that it runs the model checked here
-            self.model = self.args[self.args.index("--model") + 1] = info["id"]
+            self.model = info["id"]
         effort = info["capabilities"]["effort"]
         check_effort(self.model, self.effort, [k for k, v in effort.items() if isinstance(v, dict) and v["supported"]])
         return self
@@ -93,13 +104,22 @@ class ClaudeModel:
             headers.update({"Authorization": f"Bearer {os.environ.get('CLAUDE_CODE_OAUTH_TOKEN', '')}",
                             "anthropic-beta": "oauth-2025-04-20"})
         url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/") + path
-        try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=self.timeout) as response:
-                return json.load(response)
-        except urllib.error.HTTPError as error:
-            if error.code == 404:
-                return None
-            raise RuntimeError(f"Anthropic's model list answered {error.code}: {error.read().decode(errors='replace')[:300]}") from None
+        for attempt in range(1, LOOKUP_TRIES + 1):
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=self.timeout) as response:
+                    return json.load(response)
+            except urllib.error.HTTPError as error:
+                if error.code == 404:
+                    return None
+                problem = f"answered {error.code}: {error.read().decode(errors='replace')[:300]}"
+                # Only a rate limit or a server error can pass on its own
+                if error.code != 429 and error.code < 500:
+                    break
+            except OSError as error:
+                problem = f"couldn't be reached: {error}"
+            if attempt < LOOKUP_TRIES:
+                time.sleep(LOOKUP_RETRY_DELAY)
+        raise RuntimeError(f"Anthropic's model list at {url} {problem}")
 
     def judge(self, prompt):
         try:
@@ -137,9 +157,11 @@ class CopilotModel:
         if self.model:
             try:
                 self.check(self.loop.run_until_complete(self.client.list_models()))
-            except BadSetting:
+            except Exception as error:
                 self.__exit__()
-                raise
+                if isinstance(error, BadSetting):
+                    raise
+                raise RuntimeError(f"Copilot's model list failed: {error}") from None
         return self
 
     def check(self, available):

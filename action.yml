@@ -57,7 +57,7 @@ inputs:
     description: Comments starting with this are commands to another bot, not conversation
     default: ''
   model:
-    description: The model that judges. The default is claude-sonnet-5-5 for claude, and Copilot's own pick for copilot
+    description: The model that judges. The default is claude-sonnet-5-5 for claude, and Copilot's own pick for copilot. On Claude, a family name like sonnet means its newest model
     default: ''
   confirmations:
     description: Extra calls that must agree before a "waiting" answer stands
@@ -81,7 +81,7 @@ inputs:
     description: Seconds to wait for each model call
     default: '300'
   effort:
-    description: Reasoning effort for the model, from low, medium, high, xhigh and max. Empty leaves the provider's default
+    description: Reasoning effort for the model, such as low or high. The levels depend on the model. Empty leaves the provider's default
     default: ''
   github-tries:
     description: How many times to try a GitHub search before giving up
