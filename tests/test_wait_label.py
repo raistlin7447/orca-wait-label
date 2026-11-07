@@ -23,8 +23,8 @@ def comment(login, time, text="text", association="CONTRIBUTOR"):
     return {"author": user(login), "authorAssociation": association, "createdAt": time, "bodyText": text}
 
 
-def commit(time, committer="author", author="author"):
-    return {"commit": {"committedDate": time, "parents": {"totalCount": 1},
+def commit(time, committer="author", author="author", pushed=None):
+    return {"commit": {"committedDate": time, "parents": {"totalCount": 1}, "checkSuites": {"nodes": [{"createdAt": pushed}] if pushed else []},
                        "author": {"user": {"login": author}}, "committer": {"name": "A Person", "user": {"login": committer}}}}
 
 
@@ -41,7 +41,12 @@ def pr(comments=(), reviews=(), commits=(), labeled=(), number=1, draft=False):
             "labeled": {"nodes": [{"__typename": kind, "createdAt": time, "label": {"name": w.LABEL}} for kind, time in labeled]}}
 
 
+def decide(p, labeled, start, end):
+    return w.decide(p, w.events(p), labeled, start, end)
+
+
 ASK = comment("reviewer", "2026-01-02T00:00:00Z", "Please rebase", "MEMBER")
+ASK_EVENT = (ASK["createdAt"], "reviewer", "MEMBER", "comment", ASK["bodyText"])
 START, END = "2026-01-01T00:00:00Z", "2026-01-03T00:00:00Z"
 
 
@@ -94,9 +99,18 @@ class Events(unittest.TestCase):
         bot = comment("triager", "2026-01-02T00:00:00Z") | {"author": user("triager", "Bot")}
         self.assertEqual(self.logins(pr([bot])), ["triager"])
 
-    def test_a_commit_dated_in_the_future_counts_from_the_last_update(self):
+    def test_a_commit_without_checks_dated_after_the_last_update_is_left_out(self):
         p = pr(commits=[commit("2027-01-01T00:00:00Z")]) | {"updatedAt": "2026-01-02T00:00:00Z"}
+        self.assertEqual(w.events(p), [])
+
+    def test_a_push_counts_from_its_checks(self):
+        p = pr(commits=[commit("2027-01-01T00:00:00Z", pushed="2026-01-02T00:00:00Z")])
         self.assertEqual(w.events(p)[0][0], "2026-01-02T00:00:00Z")
+
+    def test_commits_pushed_together_count_once_from_the_push(self):
+        p = pr(commits=[commit("2026-01-01T00:00:00Z", pushed="2026-01-01T01:00:00Z"), commit("2026-01-02T00:00:00Z"),
+                        commit("2026-01-02T01:00:00Z", pushed="2026-01-02T05:00:00Z")])
+        self.assertEqual([e[0] for e in w.events(p)], ["2026-01-01T01:00:00Z", "2026-01-02T05:00:00Z"])
 
     def test_team_users_ignore_case(self):
         self.assertEqual(self.logins(pr([comment("TRIAGER", "2026-01-02T00:00:00Z")])), ["TRIAGER"])
@@ -112,74 +126,81 @@ class Events(unittest.TestCase):
 
 class Decide(unittest.TestCase):
     def test_no_model_call_until_the_team_has_spoken(self):
-        self.assertIsNone(w.decide(pr([comment("author", "2026-01-02T00:00:00Z")]), False, START, END))
+        self.assertIsNone(decide(pr([comment("author", "2026-01-02T00:00:00Z")]), False, START, END))
 
     def test_a_labeled_pr_is_judged_even_with_only_the_author_speaking(self):
         p = pr([comment("author", "2026-01-02T00:00:00Z")], labeled=[("LabeledEvent", "2026-01-01T12:00:00Z")])
-        self.assertEqual(w.decide(p, True, START, END), "judge")
+        self.assertEqual(decide(p, True, START, END), "judge")
 
     def test_every_pr_is_in_the_window_on_a_first_run(self):
-        self.assertEqual(w.decide(pr([ASK]), False, "", END), "judge")
+        self.assertEqual(decide(pr([ASK]), False, "", END), "judge")
 
     def test_new_team_message_is_judged(self):
-        self.assertEqual(w.decide(pr([ASK]), False, START, END), "judge")
+        self.assertEqual(decide(pr([ASK]), False, START, END), "judge")
 
     def test_activity_outside_the_window_is_left_alone(self):
-        self.assertIsNone(w.decide(pr([ASK]), False, END, "2026-01-04T00:00:00Z"))
-        self.assertIsNone(w.decide(pr([ASK]), False, START, "2026-01-01T12:00:00Z"))
+        self.assertIsNone(decide(pr([ASK]), False, END, "2026-01-04T00:00:00Z"))
+        self.assertIsNone(decide(pr([ASK]), False, START, "2026-01-01T12:00:00Z"))
 
     def test_label_change_after_the_activity_settles_it(self):
         p = pr([ASK], labeled=[("UnlabeledEvent", "2026-01-02T01:00:00Z")])
-        self.assertIsNone(w.decide(p, False, START, END))
+        self.assertIsNone(decide(p, False, START, END))
 
     def test_label_events_ignore_case(self):
         p = pr([ASK], labeled=[("UnlabeledEvent", "2026-01-02T01:00:00Z")])
         p["labeled"]["nodes"][0]["label"]["name"] = w.LABEL.upper()
-        self.assertIsNone(w.decide(p, False, START, END))
+        self.assertIsNone(decide(p, False, START, END))
 
     def test_author_commit_after_the_label_removes_it(self):
         p = pr([ASK], commits=[commit("2026-01-02T02:00:00Z")], labeled=[("LabeledEvent", "2026-01-02T01:00:00Z")])
-        self.assertEqual(w.decide(p, True, START, END), "remove")
+        self.assertEqual(decide(p, True, START, END), "remove")
 
     def test_a_team_message_after_the_commit_is_judged(self):
         again = comment("reviewer", "2026-01-02T03:00:00Z", "Still broken", "MEMBER")
         p = pr([again], commits=[commit("2026-01-02T02:00:00Z")], labeled=[("LabeledEvent", "2026-01-02T01:00:00Z")])
-        self.assertEqual(w.decide(p, True, START, END), "judge")
+        self.assertEqual(decide(p, True, START, END), "judge")
+
+    def test_a_commit_pushed_after_a_team_message_removes_the_label(self):
+        ping = comment("reviewer", "2026-01-02T03:00:00Z", "Any update?", "MEMBER")
+        p = pr([ping], commits=[commit("2026-01-02T02:00:00Z", pushed="2026-01-02T04:00:00Z")],
+               labeled=[("LabeledEvent", "2026-01-02T01:00:00Z")])
+        self.assertEqual(decide(p, True, "2026-01-02T12:00:00Z", END), "remove")
 
     def test_update_branch_after_the_label_keeps_it(self):
         p = pr([ASK], commits=[github_commit("2026-01-02T02:00:00Z", parents=2)], labeled=[("LabeledEvent", "2026-01-02T01:00:00Z")])
-        self.assertIsNone(w.decide(p, True, START, END))
+        self.assertIsNone(decide(p, True, START, END))
 
     def test_a_commit_dated_before_the_window_still_removes_the_label(self):
         p = pr([ASK], commits=[commit("2026-01-02T02:00:00Z")], labeled=[("LabeledEvent", "2026-01-02T01:00:00Z")])
-        self.assertEqual(w.decide(p, True, "2026-01-02T12:00:00Z", END), "remove")
+        self.assertEqual(decide(p, True, "2026-01-02T12:00:00Z", END), "remove")
 
     def test_a_label_added_after_the_commit_stays(self):
         p = pr([ASK], commits=[commit("2026-01-02T02:00:00Z")], labeled=[("LabeledEvent", "2026-01-02T03:00:00Z")])
-        self.assertIsNone(w.decide(p, True, "2026-01-02T12:00:00Z", END))
+        self.assertIsNone(decide(p, True, "2026-01-02T12:00:00Z", END))
 
     def test_a_label_event_lost_from_the_history_is_judged_not_removed(self):
         p = pr([ASK], commits=[commit("2026-01-02T02:00:00Z")])
-        self.assertEqual(w.decide(p, True, START, END), "judge")
+        self.assertEqual(decide(p, True, START, END), "judge")
 
     def test_author_comment_after_the_label_is_judged(self):
         p = pr([ASK, comment("author", "2026-01-02T02:00:00Z")], labeled=[("LabeledEvent", "2026-01-02T01:00:00Z")])
-        self.assertEqual(w.decide(p, True, START, END), "judge")
+        self.assertEqual(decide(p, True, START, END), "judge")
 
     def test_drafts_never_get_the_label_by_default(self):
-        self.assertIsNone(w.decide(pr([ASK], draft=True), False, START, END))
+        self.assertIsNone(decide(pr([ASK], draft=True), False, START, END))
         with mock.patch.object(w, "LABEL_DRAFTS", True):
-            self.assertEqual(w.decide(pr([ASK], draft=True), False, START, END), "judge")
+            self.assertEqual(decide(pr([ASK], draft=True), False, START, END), "judge")
 
     def test_a_labeled_draft_is_still_judged(self):
-        self.assertEqual(w.decide(pr([ASK], draft=True), True, START, END), "judge")
+        self.assertEqual(decide(pr([ASK], draft=True), True, START, END), "judge")
 
 
 class Prompt(unittest.TestCase):
     def test_keeps_the_last_messages_and_marks_who_spoke(self):
         comments = [comment("author", f"2026-01-02T0{i}:00:00Z", f"message {i}") for i in range(8)] + [
             comment("reviewer", "2026-01-02T09:00:00Z", "x" * 3000, "MEMBER")]
-        prompt = w.prompt_for(pr(comments))
+        p = pr(comments)
+        prompt = w.prompt_for(p, w.events(p))
         self.assertNotIn("message 2", prompt)
         self.assertIn("message 3", prompt)
         self.assertIn("@reviewer, team member", prompt)
@@ -188,7 +209,7 @@ class Prompt(unittest.TestCase):
 
     def test_zero_context_messages_sends_none(self):
         with mock.patch.object(w, "CONTEXT_MESSAGES", 0):
-            self.assertNotIn("Please rebase", w.prompt_for(pr([ASK])))
+            self.assertNotIn("Please rebase", w.prompt_for(pr([ASK]), [ASK_EVENT]))
 
 
 class FakeModel:
@@ -202,7 +223,7 @@ class FakeModel:
 
 
 def fresh_report():
-    return {"added": [], "removed": [], "judged": 0, "held": 0, "failures": 0, "failed_at": [], "usage": models.Usage()}
+    return {"added": [], "removed": [], "judged": 0, "held": 0, "failures": 0, "unusable": 0, "failed_at": [], "usage": models.Usage()}
 
 
 class Judging(unittest.TestCase):
@@ -240,6 +261,13 @@ class Judging(unittest.TestCase):
         with mock.patch.object(w, "set_label"):
             w.judge_all([("t", 1, False, "bad"), ("t", 2, False, "p")], Flaky(False), True, report)
         self.assertEqual((report["failures"], report["judged"]), (1, 1))
+
+    def test_a_failed_label_change_keeps_the_judgment(self):
+        report, out = fresh_report(), io.StringIO()
+        with mock.patch.object(w, "set_label", side_effect=RuntimeError("HTTP 403")), contextlib.redirect_stdout(out):
+            w.judge_all([("t", 1, True, "p")], FakeModel(False), True, report)
+        self.assertEqual((report["judged"], report["failures"], report["failed_at"], report["removed"]), (1, 1, ["t"], []))
+        self.assertIn("Cannot change the label on #1", out.getvalue())
 
     def test_logged_model_text_stays_on_one_line(self):
         class Injecting(FakeModel):
@@ -425,15 +453,16 @@ class Run(unittest.TestCase):
         saved, _ = self.run_main([(t, i, False, "p") for i, t in enumerate(times)], ["--apply"])
         self.assertEqual(saved, "2026-01-02T23:59:59Z")
 
-    def test_the_cap_does_not_skip_a_pr_in_the_same_second(self):
-        times = ["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z"]
-        saved, _ = self.run_main([(t, i, False, "p") for i, t in enumerate(times)], ["--apply"])
-        self.assertEqual(saved, "2026-01-01T23:59:59Z")
+    def test_the_cap_does_not_split_a_second(self):
+        times = ["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z"]
+        model = FakeModel(*[False] * 3)
+        saved, _ = self.run_main([(t, i, False, "p") for i, t in enumerate(times)], ["--apply"], model=model)
+        self.assertEqual((saved, model.calls), ("2026-01-02T23:59:59Z", 3))
 
-    def test_more_prs_in_one_second_than_the_cap_still_moves_on(self):
-        time = "2026-01-02T00:00:00Z"
-        saved, _ = self.run_main([(time, i, False, "p") for i in range(3)], ["--apply"], state="2026-01-01T23:59:59Z")
-        self.assertEqual(saved, time)
+    def test_more_prs_in_one_second_than_the_cap_are_all_judged(self):
+        time, model = "2026-01-02T00:00:00Z", FakeModel(*[False] * 3)
+        saved, window = self.run_main([(time, i, False, "p") for i in range(3)], ["--apply"], state="2026-01-01T23:59:59Z", model=model)
+        self.assertEqual((saved, model.calls), (window[1], 3))
 
     def test_an_unknown_provider_stops_the_run(self):
         with mock.patch.object(w, "PROVIDER", "Claude"), self.assertRaises(SystemExit) as stopped:
@@ -453,9 +482,19 @@ class Run(unittest.TestCase):
             self.run_main(todo, ["--apply"], model=Broken())
         write.assert_not_called()
 
-    def test_a_single_failing_pr_uses_up_a_retry(self):
-        with mock.patch.object(w, "write_state") as write, self.assertRaises(SystemExit):
+    def test_a_single_failing_pr_keeps_the_place(self):
+        out = io.StringIO()
+        with mock.patch.object(w, "write_state") as write, self.assertRaises(SystemExit), contextlib.redirect_stdout(out):
             self.run_main([("2026-01-02T00:00:00Z", 2, False, "bad")], ["--apply"], state=START, model=self.FailsOnBad())
+        write.assert_not_called()
+        self.assertNotIn("judged-through", out.getvalue())
+
+    def test_an_answer_that_does_not_fit_uses_up_a_retry(self):
+        class Unusable(FakeModel):
+            def judge(self, prompt):
+                raise ValueError("Expecting value")
+        with mock.patch.object(w, "write_state") as write, self.assertRaises(SystemExit):
+            self.run_main([("2026-01-02T00:00:00Z", 2, False, "p")], ["--apply"], state=START, model=Unusable())
         write.assert_called_once_with("2026-01-01T23:59:59Z", 1)
 
     FAILED_SECOND = [("2026-01-02T00:00:00Z", 1, False, "p"), ("2026-01-02T12:00:00Z", 2, False, "bad")]

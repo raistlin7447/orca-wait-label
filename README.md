@@ -114,7 +114,7 @@ The first runs work through every open PR, oldest first, 20 PRs at a time, and l
 
 Progress is saved in the Actions cache, and GitHub removes a cache that goes unused for 7 days. A run with no saved progress works through every open PR again, which spends credits again. Set `lookback-hours` to limit how far back it goes. Each run adds one small entry to the repository's Caches page.
 
-Until the backlog is done, each run reads every PR left in it, at about 5 GraphQL points per 20 PRs. `GITHUB_TOKEN` gets 1,000 points an hour per repository, shared with your other workflows, so a large backlog on a frequent schedule can reach the limit. That run fails and keeps its place, and a later run carries on. A personal token in `github-token` gets 5,000 points an hour.
+Until the backlog is done, each run reads every PR left in it, at about 7 GraphQL points per 20 PRs. `GITHUB_TOKEN` gets 1,000 points an hour per repository, shared with your other workflows, so a large backlog on a frequent schedule can reach the limit. That run fails and keeps its place, and a later run carries on. A personal token in `github-token` gets 5,000 points an hour.
 
 The Action needs a Linux or macOS runner with `gh` and `python3`, plus `pip` and Python 3.11 or newer for Copilot, or `npm` for Claude. `ubuntu-latest` has them all. It hasn't been tested on GitHub Enterprise Server.
 
@@ -129,12 +129,12 @@ Model names differ between providers, such as `claude-sonnet-5.5` on Copilot and
 Each run looks at open PRs with new activity from the PR author or a team member. Bots are ignored. A PR is judged once its conversation has been quiet for 30 minutes (by default), so a quick back-and-forth is judged once, at the end.
 
 - A PR without the label is skipped until a team member has spoken, which costs no model call.
-- A commit by the author dated after the label was added, and after the last team message, removes it, however late it was pushed. With a team message after the commit, the model decides instead. GitHub doesn't report push times, so a commit made before the label and pushed after it isn't noticed. A commit from an email linked to no GitHub account counts as the author's. Merges made by GitHub's "Update branch" and "Sync fork" buttons don't count, because they don't answer a review. A rebase with "Update branch" counts like any rebase by the author, and so does a merge the author makes locally.
+- A push of the author's commits after the label was added, and after the last team message, removes it. With a team message after the push, the model decides instead. GitHub doesn't report push times, so a push counts from when checks started on it. On a PR with no checks, a commit counts from its own date, so a commit made before the label or the last team message and pushed after it isn't noticed. A commit from an email linked to no GitHub account counts as the author's. Merges made by GitHub's "Update branch" and "Sync fork" buttons don't count, because they don't answer a review. A rebase with "Update branch" counts like any rebase by the author, and so does a merge the author makes locally.
 - Otherwise the model reads the last few messages and decides whether the review is waiting on the PR author, and the label is set to match.
 - A "waiting" answer has to come back three times in a row (by default). If the calls disagree, the PR counts as not waiting, because a wrong label takes a PR out of your review queue.
 - A label change made after the latest activity, by a person or by this Action, is left alone until there is new activity.
 - The Action never adds the label to a draft (by default).
-- If a PR can't be judged or its label can't be changed, the next runs start again from that PR, up to `failure-retries` times, and then move past it until its next activity. If every judgment in a run fails, the run fails and keeps its place, unless it had only one PR to judge, which counts as one of that PR's retries.
+- If a PR can't be judged or its label can't be changed, the next runs start again from that PR, up to `failure-retries` times, and then move past it until its next activity. If every PR in a run fails, the run fails and keeps its place, because a token or the model service is likely broken. When each failure was an answer from the model that didn't fit, the run still fails but counts a retry.
 - A run that hits its timeout keeps the progress it made.
 
 ## Inputs

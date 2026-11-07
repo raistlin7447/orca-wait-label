@@ -84,7 +84,8 @@ PR_FIELDS = """
   comments(last: %(comments)d) { nodes { author { __typename login } authorAssociation createdAt bodyText } }
   reviews(last: %(reviews)d) { nodes { author { __typename login } authorAssociation state submittedAt bodyText
                               comments(first: %(review_comments)d) { nodes { path bodyText } } } }
-  commits(last: %(commits)d) { nodes { commit { committedDate parents { totalCount } author { user { login } } committer { name user { login } } } } }
+  commits(last: %(commits)d) { nodes { commit { committedDate parents { totalCount } author { user { login } } committer { name user { login } }
+                                               checkSuites(first: 1) { nodes { createdAt } } } } }
 """ % {"label_events": MAX_LABEL_EVENTS, "comments": MAX_COMMENTS, "reviews": MAX_REVIEWS,
        "review_comments": MAX_REVIEW_COMMENTS, "commits": MAX_COMMITS}
 QUERY = """
@@ -193,17 +194,21 @@ def events(pr):
             continue
         text = "\n".join([r["bodyText"]] + [f"[{c['path']}] {c['bodyText']}" for c in r["comments"]["nodes"]]).strip()
         out.append((r["submittedAt"], r["author"]["login"], r["authorAssociation"], "review " + r["state"], text))
-    for c in pr["commits"]["nodes"]:
+    pushes, pushed = set(), None
+    for c in reversed(pr["commits"]["nodes"]):
         c = c["commit"]
+        # A push starts checks on its last commit, so the earliest checks on this commit or a later one date its push
+        pushed = min([s["createdAt"] for s in c["checkSuites"]["nodes"]] + ([pushed] if pushed else []), default=None)
         committer, writer = commit_login(c["committer"]), commit_login(c["author"])
         # GitHub links no account to the commits it makes, such as web edits and "Update branch" merges
         by_github = committer is None and (c["committer"] or {}).get("name") in ("GitHub", "GitHub Enterprise")
         web_edit = by_github and writer == author and c["parents"]["totalCount"] == 1
         # An email linked to no account names nobody, and the PR author is the likeliest to have pushed it
         unlinked = committer is None and not by_github and writer in (None, author)
-        if committer == author or web_edit or unlinked:
-            # A wrong clock can date a commit in the future, where it would hold the PR back until then
-            out.append((min(c["committedDate"], pr["updatedAt"]), author, "", "commit", ""))
+        # Without checks only the commit's own date is known, and a date after the PR's last update comes from a wrong clock
+        if (committer == author or web_edit or unlinked) and (pushed or c["committedDate"] <= pr["updatedAt"]):
+            pushes.add(pushed or c["committedDate"])
+    out += [(t, author, "", "commit", "") for t in pushes]
     return sorted(e for e in out if e[1] == author or e[2] in TEAM or e[1].lower() in TEAM_USERS)
 
 
@@ -212,10 +217,9 @@ def label_changed(pr, types=("LabeledEvent", "UnlabeledEvent")):
                 if e and e["__typename"] in types and e["label"]["name"].lower() == LABEL.lower()), default="")
 
 
-def decide(pr, labeled, start, end):
+def decide(pr, evs, labeled, start, end):
     """'remove', 'judge' or None for a PR found by a search since start, whose activity must not be after end."""
     author = pr["author"]["login"]
-    evs = events(pr)
     if not evs or evs[-1][0] > end:
         return None
     # A label change after the latest activity, by a person or by this bot, already settled it
@@ -224,7 +228,7 @@ def decide(pr, labeled, start, end):
     labeled_at = label_changed(pr, ("LabeledEvent",))
     # A team message after the commit can be a new request, which only the model can read
     last_team = max((e[0] for e in evs if e[1] != author), default="")
-    # A commit can be pushed long after its date, so start doesn't apply to it
+    # Without checks a commit has only its own date, which can be long before its push, so start doesn't apply to it
     # Other labels' events can push this label's out of the fetched history, which leaves labeled_at empty
     if labeled and labeled_at and any(e[1] == author and e[3] == "commit" and e[0] > max(labeled_at, last_team) for e in evs):
         return "remove"
@@ -237,9 +241,8 @@ def decide(pr, labeled, start, end):
     return None if pr["isDraft"] and not labeled and not LABEL_DRAFTS else "judge"
 
 
-def prompt_for(pr):
+def prompt_for(pr, evs):
     lines = [f"PR #{pr['number']}: {pr['title']}", f"PR author: @{pr['author']['login']}", "", "Recent messages, oldest first:"]
-    evs = events(pr)
     for t, login, _, kind, text in evs[max(len(evs) - CONTEXT_MESSAGES, 0):]:
         who = "PR author" if login == pr["author"]["login"] else "team member"
         body = "(pushed commits)" if kind == "commit" else (text[:MAX_TEXT] or "(no text)")
@@ -291,16 +294,17 @@ def collect(start, end, apply, report):
         for pr in prs:
             if is_bot(pr["author"]):
                 continue
-            action = decide(pr, labeled, start, end)
+            evs = events(pr)
+            action = decide(pr, evs, labeled, start, end)
             if action == "remove":
                 try:
                     set_label(pr["number"], False, apply)
                     report["removed"].append(pr["number"])
                 except RuntimeError as error:
                     print(f"::warning::Cannot remove the label from #{pr['number']}: {one_line(error)}")
-                    report["failed_at"].append(events(pr)[-1][0])
+                    report["failed_at"].append(evs[-1][0])
             elif action == "judge":
-                todo.append((events(pr)[-1][0], pr["number"], labeled, prompt_for(pr)))
+                todo.append((evs[-1][0], pr["number"], labeled, prompt_for(pr, evs)))
     return sorted(todo)
 
 
@@ -320,17 +324,25 @@ def judge_all(todo, model, apply, report, checkpoint=lambda done: None):
     for done, (when, number, labeled, prompt) in enumerate(todo, 1):
         try:
             verdict = judge(model, prompt, report["usage"])
-            report["judged"] += 1
-            # Off by default because a public Actions log would show the model's judgment of each named contributor's PR
-            if LOG_REASONS:
-                print(f"#{number} waiting_on_author={verdict['waiting_on_author']}: {one_line(verdict['reason'])}")
-            if verdict["waiting_on_author"] != labeled:
-                set_label(number, not labeled, apply)
-                report["removed" if labeled else "added"].append(number)
         except Exception as error:
             print(f"::warning::Cannot judge #{number}: {one_line(error)}")
             report["failures"] += 1
             report["failed_at"].append(when)
+            # An answer that doesn't fit the schema comes from this PR, while other errors come from the model service
+            report["unusable"] += isinstance(error, (ValueError, KeyError, TypeError))
+        else:
+            report["judged"] += 1
+            # Off by default because a public Actions log would show the model's judgment of each named contributor's PR
+            if LOG_REASONS:
+                print(f"#{number} waiting_on_author={verdict['waiting_on_author']}: {one_line(verdict.get('reason', ''))}")
+            if verdict["waiting_on_author"] != labeled:
+                try:
+                    set_label(number, not labeled, apply)
+                    report["removed" if labeled else "added"].append(number)
+                except RuntimeError as error:
+                    print(f"::warning::Cannot change the label on #{number}: {one_line(error)}")
+                    report["failures"] += 1
+                    report["failed_at"].append(when)
         checkpoint(done)
 
 
@@ -401,7 +413,7 @@ def main():
     if not args.since and not saved:
         print(f"No saved progress, so starting from {start or 'the oldest open PR'}")
 
-    report = {"added": [], "removed": [], "judged": 0, "held": 0, "failures": 0, "failed_at": [], "usage": Usage()}
+    report = {"added": [], "removed": [], "judged": 0, "held": 0, "failures": 0, "unusable": 0, "failed_at": [], "usage": Usage()}
     ensure_label(args.apply)
     todo = collect(start, end, args.apply, report)
 
@@ -412,12 +424,14 @@ def main():
         return
 
     # What the cap holds back is judged next run, which starts just before the first PR held
-    if MAX_JUDGMENTS and len(todo) > MAX_JUDGMENTS:
-        report["held"] = len(todo) - MAX_JUDGMENTS
-        resume = before(todo[MAX_JUDGMENTS][0])
-        todo = todo[:MAX_JUDGMENTS]
-        # More PRs in one second than the cap would otherwise never get past that second
-        end = resume if resume > start else todo[-1][0]
+    cut = MAX_JUDGMENTS
+    # A cut inside a second would have the next run judge that second's earlier PRs again
+    while cut and cut < len(todo) and todo[cut][0] == todo[cut - 1][0]:
+        cut += 1
+    if cut and len(todo) > cut:
+        report["held"] = len(todo) - cut
+        end = before(todo[cut][0])
+        todo = todo[:cut]
 
     def checkpoint(done):
         # A run cut off by its timeout keeps its place, unless nothing has worked yet
@@ -428,13 +442,14 @@ def main():
         with open_model() as model:
             judge_all(todo, model, args.apply, report, checkpoint)
     through, retries = progress(todo, len(todo), start, end, report, retries)
-    write_report(report, through)
     all_failed = todo and report["failures"] == len(todo)
-    # Every call failing means the token or the model is broken, unless one PR was all there was to judge
-    if not all_failed or len(todo) == 1:
+    # Every PR failing means a token or the model service is broken, unless each failure was an answer that didn't fit
+    keep_place = all_failed and report["unusable"] < report["failures"]
+    write_report(report, "" if keep_place else through)
+    if not keep_place:
         write_state(through, retries)
     if all_failed:
-        sys.exit("Every judgment failed")
+        sys.exit("Every PR failed")
 
 
 if __name__ == "__main__":
