@@ -45,11 +45,11 @@ inputs:
     description: Who counts as the team, by GitHub's author association. Empty leaves only team-users
     default: OWNER,MEMBER,COLLABORATOR
   team-users:
-    description: Comma-separated logins that also count as the team
+    description: Comma-separated logins that also count as the team, including a bot that speaks for it
     default: ''
   ignored-users:
-    description: Accounts ignored as well as GitHub's bot accounts. Empty ignores no others
-    default: github-actions,copilot-pull-request-reviewer,Copilot,coderabbitai,dependabot
+    description: Comma-separated logins to ignore, such as a person's account that a bot posts from. GitHub's bot accounts are always ignored
+    default: ''
   command-prefix:
     description: Comments starting with this are commands to another bot, not conversation
     default: ''

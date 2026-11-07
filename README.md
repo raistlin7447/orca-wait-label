@@ -129,12 +129,12 @@ Model names differ between providers, such as `claude-sonnet-5.5` on Copilot and
 Each run looks at open PRs with new activity from the PR author or a team member. Bots are ignored. A PR is judged once its conversation has been quiet for 30 minutes (by default), so a quick back-and-forth is judged once, at the end.
 
 - A PR without the label is skipped until a team member has spoken, which costs no model call.
-- A commit by the author dated after the label was added removes it, however late it was pushed. GitHub doesn't report push times, so a commit made before the label and pushed after it isn't noticed. A commit from an email linked to no GitHub account counts as the author's. Merges made by GitHub's "Update branch" and "Sync fork" buttons don't count, because they don't answer a review. A rebase with "Update branch" counts like any rebase by the author, and so does a merge the author makes locally.
+- A commit by the author dated after the label was added, and after the last team message, removes it, however late it was pushed. With a team message after the commit, the model decides instead. GitHub doesn't report push times, so a commit made before the label and pushed after it isn't noticed. A commit from an email linked to no GitHub account counts as the author's. Merges made by GitHub's "Update branch" and "Sync fork" buttons don't count, because they don't answer a review. A rebase with "Update branch" counts like any rebase by the author, and so does a merge the author makes locally.
 - Otherwise the model reads the last few messages and decides whether the review is waiting on the PR author, and the label is set to match.
 - A "waiting" answer has to come back three times in a row (by default). If the calls disagree, the PR counts as not waiting, because a wrong label takes a PR out of your review queue.
 - A label change made after the latest activity, by a person or by this Action, is left alone until there is new activity.
 - The Action never adds the label to a draft (by default).
-- If a PR can't be judged or its label can't be changed, the next runs start again from that PR, up to `failure-retries` times, and then move past it until its next activity. If every judgment in a run fails, the run fails and keeps its place.
+- If a PR can't be judged or its label can't be changed, the next runs start again from that PR, up to `failure-retries` times, and then move past it until its next activity. If every judgment in a run fails, the run fails and keeps its place, unless it had only one PR to judge, which counts as one of that PR's retries.
 - A run that hits its timeout keeps the progress it made.
 
 ## Inputs
@@ -154,8 +154,8 @@ Each run looks at open PRs with new activity from the PR author or a team member
 | `label-color` | `fbca04` | The color for a label this Action creates |
 | `label-drafts` | `false` | Whether the label can be added to draft PRs |
 | `team-associations` | `OWNER,MEMBER,COLLABORATOR` | Who counts as the team, by GitHub's author association. Empty leaves only `team-users` |
-| `team-users` | | Comma-separated logins that also count as the team |
-| `ignored-users` | `github-actions,copilot-pull-request-reviewer,Copilot,coderabbitai,dependabot` | Accounts ignored as well as GitHub's bot accounts. Empty ignores no others |
+| `team-users` | | Comma-separated logins that also count as the team, including a bot that speaks for it |
+| `ignored-users` | | Comma-separated logins to ignore, such as a person's account that a bot posts from. GitHub's bot accounts are always ignored |
 | `command-prefix` | | Comments starting with this are commands to another bot, not conversation |
 | `model` | `claude-sonnet-5-5` for `claude`, Copilot's pick for `copilot` | The model that judges |
 | `confirmations` | `2` | Extra calls that must agree before a "waiting" answer stands |

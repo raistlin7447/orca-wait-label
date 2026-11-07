@@ -40,7 +40,7 @@ LABEL_COLOR = setting("LABEL_COLOR", "fbca04")
 TEAM = {s.upper() for s in setting_list("TEAM_ASSOCIATIONS", "OWNER,MEMBER,COLLABORATOR")}
 # Logins that count as the team, whatever their association
 TEAM_USERS = login_list("TEAM_USERS", "")
-IGNORED_USERS = login_list("IGNORED_USERS", "github-actions,copilot-pull-request-reviewer,Copilot,coderabbitai,dependabot")
+IGNORED_USERS = login_list("IGNORED_USERS", "")
 # Comments starting with this are commands to another bot, not conversation
 COMMAND_PREFIX = setting("COMMAND_PREFIX", "")
 PROVIDER = setting("PROVIDER", "copilot")
@@ -170,7 +170,11 @@ def search_all(q, start):
 
 def is_bot(actor):
     # A deleted account has no actor
-    return not actor or actor["__typename"] == "Bot" or actor["login"].lower() in IGNORED_USERS
+    if not actor:
+        return True
+    login = actor["login"].lower()
+    # A bot named in team-users speaks for the team
+    return login in IGNORED_USERS or (actor["__typename"] == "Bot" and login not in TEAM_USERS)
 
 
 def commit_login(actor):
@@ -198,7 +202,8 @@ def events(pr):
         # An email linked to no account names nobody, and the PR author is the likeliest to have pushed it
         unlinked = committer is None and not by_github and writer in (None, author)
         if committer == author or web_edit or unlinked:
-            out.append((c["committedDate"], author, "", "commit", ""))
+            # A wrong clock can date a commit in the future, where it would hold the PR back until then
+            out.append((min(c["committedDate"], pr["updatedAt"]), author, "", "commit", ""))
     return sorted(e for e in out if e[1] == author or e[2] in TEAM or e[1].lower() in TEAM_USERS)
 
 
@@ -217,9 +222,11 @@ def decide(pr, labeled, start, end):
     if label_changed(pr) > evs[-1][0]:
         return None
     labeled_at = label_changed(pr, ("LabeledEvent",))
+    # A team message after the commit can be a new request, which only the model can read
+    last_team = max((e[0] for e in evs if e[1] != author), default="")
     # A commit can be pushed long after its date, so start doesn't apply to it
     # Other labels' events can push this label's out of the fetched history, which leaves labeled_at empty
-    if labeled and labeled_at and any(e[1] == author and e[3] == "commit" and e[0] > labeled_at for e in evs):
+    if labeled and labeled_at and any(e[1] == author and e[3] == "commit" and e[0] > max(labeled_at, last_team) for e in evs):
         return "remove"
     if evs[-1][0] <= start:
         return None
@@ -277,9 +284,11 @@ def collect(start, end, apply, report):
     """Removes the labels that need no judgment and returns the rest, oldest first."""
     # A search stops at SEARCH_LIMIT results, so oldest first lets the next search start from the last result
     open_prs = f"repo:{REPO_OWNER}/{REPO_NAME} is:pr is:open sort:updated-asc"
+    # Both searches run before any label changes, so that a failed search changes nothing
+    found = [(labeled, search_all(q, start)) for labeled, q in ((True, f'{open_prs} label:"{LABEL}"'), (False, f'{open_prs} -label:"{LABEL}"'))]
     todo = []
-    for labeled, q in ((True, f'{open_prs} label:"{LABEL}"'), (False, f'{open_prs} -label:"{LABEL}"')):
-        for pr in search_all(q, start):
+    for labeled, prs in found:
+        for pr in prs:
             if is_bot(pr["author"]):
                 continue
             action = decide(pr, labeled, start, end)
@@ -420,10 +429,12 @@ def main():
             judge_all(todo, model, args.apply, report, checkpoint)
     through, retries = progress(todo, len(todo), start, end, report, retries)
     write_report(report, through)
-    # Every call failing means the token or the model is broken
-    if todo and report["failures"] == len(todo):
+    all_failed = todo and report["failures"] == len(todo)
+    # Every call failing means the token or the model is broken, unless one PR was all there was to judge
+    if not all_failed or len(todo) == 1:
+        write_state(through, retries)
+    if all_failed:
         sys.exit("Every judgment failed")
-    write_state(through, retries)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,8 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.update({"WAIT_LABEL_REPO": "owner/repo", "WAIT_LABEL_COMMAND_PREFIX": "/bot", "WAIT_LABEL_TEAM_USERS": "triager"})
+os.environ.update({"WAIT_LABEL_REPO": "owner/repo", "WAIT_LABEL_COMMAND_PREFIX": "/bot", "WAIT_LABEL_TEAM_USERS": "triager",
+                   "WAIT_LABEL_IGNORED_USERS": "coderabbitai"})
 import models  # noqa: E402
 import wait_label as w  # noqa: E402
 
@@ -35,7 +36,7 @@ def github_commit(time, author="author", parents=1, name="GitHub"):
 
 
 def pr(comments=(), reviews=(), commits=(), labeled=(), number=1, draft=False):
-    return {"number": number, "title": "A title", "isDraft": draft, "author": user("author"),
+    return {"number": number, "title": "A title", "isDraft": draft, "author": user("author"), "updatedAt": "2026-01-10T00:00:00Z",
             "comments": {"nodes": list(comments)}, "reviews": {"nodes": list(reviews)}, "commits": {"nodes": list(commits)},
             "labeled": {"nodes": [{"__typename": kind, "createdAt": time, "label": {"name": w.LABEL}} for kind, time in labeled]}}
 
@@ -83,6 +84,20 @@ class Events(unittest.TestCase):
         c["commit"]["committer"] = None
         self.assertEqual(self.logins(pr(commits=[c])), [])
 
+    def test_a_deleted_account_is_left_out(self):
+        review = {"author": None, "authorAssociation": "MEMBER", "state": "COMMENTED", "submittedAt": "2026-01-02T00:00:00Z",
+                  "bodyText": "Why?", "comments": {"nodes": []}}
+        p = pr([comment("x", "2026-01-02T00:00:00Z", association="MEMBER") | {"author": None}], reviews=[review])
+        self.assertEqual(self.logins(p), [])
+
+    def test_a_bot_in_team_users_speaks_for_the_team(self):
+        bot = comment("triager", "2026-01-02T00:00:00Z") | {"author": user("triager", "Bot")}
+        self.assertEqual(self.logins(pr([bot])), ["triager"])
+
+    def test_a_commit_dated_in_the_future_counts_from_the_last_update(self):
+        p = pr(commits=[commit("2027-01-01T00:00:00Z")]) | {"updatedAt": "2026-01-02T00:00:00Z"}
+        self.assertEqual(w.events(p)[0][0], "2026-01-02T00:00:00Z")
+
     def test_team_users_ignore_case(self):
         self.assertEqual(self.logins(pr([comment("TRIAGER", "2026-01-02T00:00:00Z")])), ["TRIAGER"])
 
@@ -125,6 +140,11 @@ class Decide(unittest.TestCase):
     def test_author_commit_after_the_label_removes_it(self):
         p = pr([ASK], commits=[commit("2026-01-02T02:00:00Z")], labeled=[("LabeledEvent", "2026-01-02T01:00:00Z")])
         self.assertEqual(w.decide(p, True, START, END), "remove")
+
+    def test_a_team_message_after_the_commit_is_judged(self):
+        again = comment("reviewer", "2026-01-02T03:00:00Z", "Still broken", "MEMBER")
+        p = pr([again], commits=[commit("2026-01-02T02:00:00Z")], labeled=[("LabeledEvent", "2026-01-02T01:00:00Z")])
+        self.assertEqual(w.decide(p, True, START, END), "judge")
 
     def test_update_branch_after_the_label_keeps_it(self):
         p = pr([ASK], commits=[github_commit("2026-01-02T02:00:00Z", parents=2)], labeled=[("LabeledEvent", "2026-01-02T01:00:00Z")])
@@ -261,6 +281,13 @@ class Search(unittest.TestCase):
         with mock.patch.object(w, "search", return_value=self.found(1, 2)) as search, mock.patch.object(w, "SEARCH_LIMIT", 2):
             w.search_all("q", "2026-01-02T12:00:00Z")
         self.assertEqual(search.call_count, 1)
+
+    def test_a_failed_search_changes_no_labels(self):
+        p = pr([ASK], commits=[commit("2026-01-02T02:00:00Z")], labeled=[("LabeledEvent", "2026-01-02T01:00:00Z")])
+        with mock.patch.object(w, "search", side_effect=[[p], RuntimeError("HTTP 502")]), \
+                mock.patch.object(w, "set_label") as set_label, self.assertRaises(RuntimeError):
+            w.collect(START, END, True, fresh_report())
+        set_label.assert_not_called()
 
     def test_a_pr_by_a_bot_is_left_out(self):
         with mock.patch.object(w, "search", side_effect=[[], [pr([ASK]) | {"author": user("renovate", "Bot")}]]):
@@ -421,9 +448,15 @@ class Run(unittest.TestCase):
         class Broken(FakeModel):
             def judge(self, prompt):
                 raise RuntimeError("bad token")
+        todo = [("2026-01-02T00:00:00Z", 1, False, "p"), ("2026-01-02T12:00:00Z", 2, False, "p")]
         with mock.patch.object(w, "write_state") as write, self.assertRaises(SystemExit):
-            self.run_main([("2026-01-02T00:00:00Z", 1, False, "p")], ["--apply"], model=Broken())
+            self.run_main(todo, ["--apply"], model=Broken())
         write.assert_not_called()
+
+    def test_a_single_failing_pr_uses_up_a_retry(self):
+        with mock.patch.object(w, "write_state") as write, self.assertRaises(SystemExit):
+            self.run_main([("2026-01-02T00:00:00Z", 2, False, "bad")], ["--apply"], state=START, model=self.FailsOnBad())
+        write.assert_called_once_with("2026-01-01T23:59:59Z", 1)
 
     FAILED_SECOND = [("2026-01-02T00:00:00Z", 1, False, "p"), ("2026-01-02T12:00:00Z", 2, False, "bad")]
 
