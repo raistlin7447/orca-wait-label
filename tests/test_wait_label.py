@@ -352,8 +352,8 @@ class Search(unittest.TestCase):
 
 class Filter(unittest.TestCase):
     def test_keeps_terms_and_quoted_values(self):
-        self.assertEqual(w.pr_filter('base:main -label:"on hold",stale -is:draft fix'),
-                         ('base:main -label:"on hold",stale -is:draft fix', []))
+        self.assertEqual(w.pr_filter('base:main -label:"on hold",stale -is:draft -no:label fix'),
+                         ('base:main -label:"on hold",stale -is:draft -no:label fix', []))
 
     def test_leaves_out_what_the_action_sets_itself(self):
         terms = "sort:created-desc updated:>2026-01-01 is:pr IS:OPEN"
@@ -700,15 +700,20 @@ class Providers(unittest.TestCase):
         """Fakes the Models API, where None stands for a 404 and a number for another error status."""
         def respond(request, timeout):
             self.requests.append(request)
+            self.timeouts.append(timeout)
             body = bodies[min(len(self.requests), len(bodies)) - 1]
             if isinstance(body, Exception):
                 raise body
+            if isinstance(body, bytes):
+                response = mock.MagicMock()
+                response.__enter__.return_value = io.BytesIO(body)
+                return response
             if body is None or isinstance(body, int):
                 raise urllib.error.HTTPError(request.full_url, body or 404, "x", {}, io.BytesIO(b"denied"))
             response = mock.MagicMock()
             response.__enter__.return_value = io.BytesIO(json.dumps(body).encode())
             return response
-        self.requests = []
+        self.requests, self.timeouts = [], []
         return mock.patch("urllib.request.urlopen", side_effect=respond)
 
     EFFORTS = {"supported": True, "low": {"supported": True}, "high": {"supported": True}, "max": {"supported": False}}
@@ -750,6 +755,7 @@ class Providers(unittest.TestCase):
         with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "", "CLAUDE_CODE_OAUTH_TOKEN": "token"}), self.answers(info):
             self.claude()
         self.assertEqual(self.requests[0].get_header("Authorization"), "Bearer token")
+        self.assertEqual(self.timeouts, [models.LOOKUP_TIMEOUT])
 
     def test_a_refused_claude_lookup_raises(self):
         with self.answers(401), self.assertRaisesRegex(RuntimeError, "answered 401"):
@@ -765,6 +771,17 @@ class Providers(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "couldn't be reached"):
             self.claude()
         self.assertEqual(len(self.requests), models.LOOKUP_TRIES)
+
+    def test_a_model_list_that_is_not_json_raises(self):
+        with self.answers(b"<html>Sign in</html>"), self.assertRaisesRegex(RuntimeError, "didn't answer with JSON"):
+            self.claude()
+
+    def test_a_gateway_that_only_lists_models_still_finds_a_full_id(self):
+        listing = {"data": [{"id": "claude-sonnet-5-5", "created_at": "2026-09-28T00:00:00Z", "capabilities": {"effort": self.EFFORTS}}]}
+        out = io.StringIO()
+        with self.answers(None, listing), contextlib.redirect_stdout(out):
+            self.assertEqual(self.claude(effort="high").model, "claude-sonnet-5-5")
+        self.assertEqual(out.getvalue(), "")
 
     def test_a_gateway_without_a_model_list_skips_the_check(self):
         out = io.StringIO()
@@ -785,6 +802,7 @@ class Providers(unittest.TestCase):
 
             async def stop(self):
                 Client.stopped = True
+                raise ConnectionError("already gone")
 
             async def list_models(self):
                 raise ConnectionError("denied")

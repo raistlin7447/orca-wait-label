@@ -34,7 +34,7 @@ class UnusableAnswer(Exception):
 
 
 CLAUDE_TOKENS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
-LOOKUP_TRIES, LOOKUP_RETRY_DELAY = 3, 10
+LOOKUP_TRIES, LOOKUP_RETRY_DELAY, LOOKUP_TIMEOUT = 3, 10, 30
 SECRET_WORDS = ("TOKEN", "SECRET", "PASSWORD", "KEY")
 
 
@@ -80,12 +80,15 @@ class ClaudeModel:
                 print("The model list isn't available, so model and effort go to Claude unchecked")
                 return self
             available = listing["data"]
+            # Some gateways list models without looking them up by ID
+            exact = [m for m in available if m["id"] == self.model]
             # A family name such as sonnet means its newest model, as in claude-sonnet-5-5
-            family = [m for m in available if m["id"].split("-")[1:2] == [self.model.lower()]]
+            family = exact or [m for m in available if m["id"].split("-")[1:2] == [self.model.lower()]]
             if not family:
                 raise BadSetting(f"model must be one of {', '.join(m['id'] for m in available)}, or a family such as sonnet, not {self.model!r}")
             info = max(family, key=lambda m: m["created_at"])
-            print(f"Using {info['id']} for model {self.model}")
+            if not exact:
+                print(f"Using {info['id']} for model {self.model}")
             # The CLI gets the full ID, so that it runs the model checked here
             self.model = info["id"]
         effort = info["capabilities"]["effort"]
@@ -106,13 +109,15 @@ class ClaudeModel:
         url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/") + path
         for attempt in range(1, LOOKUP_TRIES + 1):
             try:
-                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=self.timeout) as response:
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=LOOKUP_TIMEOUT) as response:
                     return json.load(response)
+            except ValueError:
+                raise RuntimeError(f"Anthropic's model list at {url} didn't answer with JSON") from None
             except urllib.error.HTTPError as error:
                 if error.code == 404:
                     return None
                 problem = f"answered {error.code}: {error.read().decode(errors='replace')[:300]}"
-                # Only a rate limit or a server error can pass on its own
+                # Only a rate limit or a server error can clear up on a retry
                 if error.code != 429 and error.code < 500:
                     break
             except OSError as error:
@@ -158,7 +163,11 @@ class CopilotModel:
             try:
                 self.check(self.loop.run_until_complete(self.client.list_models()))
             except Exception as error:
-                self.__exit__()
+                # A client that fails to stop must not hide why the check failed
+                try:
+                    self.__exit__()
+                except Exception:
+                    pass
                 if isinstance(error, BadSetting):
                     raise
                 raise RuntimeError(f"Copilot's model list failed: {error}") from None
