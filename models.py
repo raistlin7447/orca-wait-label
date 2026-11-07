@@ -25,7 +25,7 @@ class UnusableAnswer(Exception):
     """The model answered, but not with a verdict the bot can read."""
 
 
-CLAUDE_TOKENS =("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
+CLAUDE_TOKENS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
 SECRET_WORDS = ("TOKEN", "SECRET", "PASSWORD", "KEY")
 
 

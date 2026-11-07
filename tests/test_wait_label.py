@@ -369,8 +369,9 @@ class GitHubCalls(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "checks: read"):
             w.search("q")
 
-    def test_a_404_is_not_tried_again(self):
-        self.assertEqual(self.failing(3, "HTTP 404"), (1, 0))
+    def test_a_404_or_a_refusal_is_not_tried_again(self):
+        for stderr in ("HTTP 404", "Resource not accessible by integration"):
+            self.assertEqual(self.failing(3, stderr), (1, 0))
 
 
 class Labels(unittest.TestCase):

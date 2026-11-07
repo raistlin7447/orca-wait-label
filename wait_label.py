@@ -137,7 +137,7 @@ def gh(*args, tries=GITHUB_TRIES):
         out = subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8")
         if out.returncode == 0:
             return out.stdout
-        if "HTTP 404" in out.stderr:
+        if "HTTP 404" in out.stderr or "Resource not accessible" in out.stderr:
             break
         if attempt < tries:
             time.sleep(GITHUB_RETRY_DELAY)
