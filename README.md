@@ -127,7 +127,7 @@ Model names differ between providers, such as `claude-sonnet-5.5` on Copilot and
 Each run looks at open PRs with new activity from the PR author or a team member. Bots are ignored. A PR is judged once its conversation has been quiet for 30 minutes (by default), so a quick back-and-forth is judged once, at the end.
 
 - A PR without the label is skipped until a team member has spoken, which costs no model call.
-- A commit by the author dated after the label was added removes it, however late it was pushed. GitHub doesn't report push times, so a commit made before the label and pushed after it isn't noticed. A commit from an email linked to no GitHub account counts as the author's.
+- A commit by the author dated after the label was added removes it, however late it was pushed. GitHub doesn't report push times, so a commit made before the label and pushed after it isn't noticed. A commit from an email linked to no GitHub account counts as the author's. GitHub's "Update branch" and "Sync fork" buttons don't count, because they don't answer a review.
 - Otherwise the model reads the last few messages and decides whether the review is waiting on the PR author, and the label is set to match.
 - A "waiting" answer has to come back three times in a row (by default). If the calls disagree, the PR counts as not waiting, because a wrong label takes a PR out of your review queue.
 - A label change made after the latest activity, by a person or by this Action, is left alone until there is new activity.

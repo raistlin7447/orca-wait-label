@@ -19,8 +19,15 @@ def comment(login, time, text="text", association="CONTRIBUTOR"):
 
 
 def commit(time, committer="author", author="author", authored=None):
-    return {"commit": {"authoredDate": authored or time, "committedDate": time,
-                       "author": {"user": {"login": author}}, "committer": {"user": {"login": committer}}}}
+    return {"commit": {"authoredDate": authored or time, "committedDate": time, "parents": {"totalCount": 1},
+                       "author": {"user": {"login": author}}, "committer": {"name": "A Person", "user": {"login": committer}}}}
+
+
+def github_commit(time, author="author", authored=None, parents=1):
+    c = commit(time, author=author, authored=authored)
+    c["commit"]["committer"] = {"name": "GitHub", "user": None}
+    c["commit"]["parents"]["totalCount"] = parents
+    return c
 
 
 def pr(comments=(), reviews=(), commits=(), labeled=(), number=1, draft=False):
@@ -49,15 +56,19 @@ class Events(unittest.TestCase):
         self.assertEqual(self.logins(p), [])
 
     def test_web_editor_commit_counts_as_the_author(self):
-        p = pr(commits=[commit("2026-01-02T00:00:00Z", committer="web-flow")])
+        p = pr(commits=[github_commit("2026-01-02T00:00:00Z")])
         self.assertEqual(self.logins(p), ["author"])
 
-    def test_update_branch_is_not_the_author_working(self):
-        p = pr(commits=[commit("2026-01-02T00:00:00Z", committer="web-flow", authored="2026-01-01T00:00:00Z")])
+    def test_update_branch_merge_is_not_the_author_working(self):
+        p = pr(commits=[github_commit("2026-01-02T00:00:00Z", parents=2)])
+        self.assertEqual(self.logins(p), [])
+
+    def test_update_branch_rebase_is_not_the_author_working(self):
+        p = pr(commits=[github_commit("2026-01-02T00:00:00Z", authored="2026-01-01T00:00:00Z")])
         self.assertEqual(self.logins(p), [])
 
     def test_a_team_members_commit_is_not_the_author(self):
-        p = pr(commits=[commit("2026-01-02T00:00:00Z", committer="web-flow", author="reviewer")])
+        p = pr(commits=[github_commit("2026-01-02T00:00:00Z", author="reviewer")])
         self.assertEqual(self.logins(p), [])
 
     def test_a_commit_linked_to_no_account_counts_as_the_author(self):
@@ -113,6 +124,10 @@ class Decide(unittest.TestCase):
     def test_author_commit_after_the_label_removes_it(self):
         p = pr([ASK], commits=[commit("2026-01-02T02:00:00Z")], labeled=[("LabeledEvent", "2026-01-02T01:00:00Z")])
         self.assertEqual(w.decide(p, True, START, END), "remove")
+
+    def test_update_branch_after_the_label_keeps_it(self):
+        p = pr([ASK], commits=[github_commit("2026-01-02T02:00:00Z", parents=2)], labeled=[("LabeledEvent", "2026-01-02T01:00:00Z")])
+        self.assertIsNone(w.decide(p, True, START, END))
 
     def test_a_commit_dated_before_the_window_still_removes_the_label(self):
         p = pr([ASK], commits=[commit("2026-01-02T02:00:00Z")], labeled=[("LabeledEvent", "2026-01-02T01:00:00Z")])

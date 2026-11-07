@@ -84,7 +84,7 @@ PR_FIELDS = """
   comments(last: %(comments)d) { nodes { author { login } authorAssociation createdAt bodyText } }
   reviews(last: %(reviews)d) { nodes { author { login } authorAssociation state submittedAt bodyText
                               comments(first: %(review_comments)d) { nodes { path bodyText } } } }
-  commits(last: %(commits)d) { nodes { commit { authoredDate committedDate author { user { login } } committer { user { login } } } } }
+  commits(last: %(commits)d) { nodes { commit { authoredDate committedDate parents { totalCount } author { user { login } } committer { name user { login } } } } }
 """ % {"label_events": MAX_LABEL_EVENTS, "comments": MAX_COMMENTS, "reviews": MAX_REVIEWS,
        "review_comments": MAX_REVIEW_COMMENTS, "commits": MAX_COMMITS}
 QUERY = """
@@ -179,10 +179,11 @@ def events(pr):
     for c in pr["commits"]["nodes"]:
         c = c["commit"]
         committer, writer = commit_login(c["committer"]), commit_login(c["author"])
-        # A web editor commit has committer web-flow; "Update branch" rebases keep the old authored date
-        web_edit = committer == "web-flow" and writer == author and c["authoredDate"] == c["committedDate"]
+        # GitHub's own commits link no committer account; "Update branch" makes merges, or rebases that keep the old authored date
+        by_github = committer is None and (c["committer"] or {}).get("name") == "GitHub"
+        web_edit = by_github and writer == author and c["parents"]["totalCount"] == 1 and c["authoredDate"] == c["committedDate"]
         # An email linked to no account names nobody, and the PR author is the likeliest to have pushed it
-        unlinked = committer is None and writer in (None, author)
+        unlinked = committer is None and not by_github and writer in (None, author)
         if committer == author or web_edit or unlinked:
             out.append((c["committedDate"], author, "", "commit", ""))
     return sorted(e for e in out if e[1] == author or e[2] in TEAM or e[1].lower() in TEAM_USERS)
