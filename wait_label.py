@@ -67,7 +67,7 @@ def choice(name, default, choices):
 REPOSITORY = setting("REPO", os.environ.get("GITHUB_REPOSITORY", ""))
 if not re.fullmatch(r"[\w.-]+/[\w.-]+", REPOSITORY):
     sys.exit(f"repository must be owner/name, not {REPOSITORY!r}")
-REPO_OWNER, REPO_NAME = REPOSITORY.split("/")
+REPO_NAME = REPOSITORY.split("/")[1]
 LABEL = setting("LABEL", "waiting on author")
 LABEL_COLOR = setting("LABEL_COLOR", "fbca04").lstrip("#")
 if not re.fullmatch("[0-9a-fA-F]{6}", LABEL_COLOR):
@@ -310,7 +310,7 @@ def check_repository():
 
 
 def ensure_label(apply):
-    path = f"repos/{REPO_OWNER}/{REPO_NAME}/labels"
+    path = f"repos/{REPOSITORY}/labels"
     try:
         gh("api", f"{path}/{quote(LABEL, safe='')}")
     except RuntimeError as error:
@@ -323,7 +323,7 @@ def ensure_label(apply):
 
 
 def set_label(number, add, apply):
-    path = f"repos/{REPO_OWNER}/{REPO_NAME}/issues/{number}/labels"
+    path = f"repos/{REPOSITORY}/issues/{number}/labels"
     try:
         if apply and add:
             gh("api", path, "-X", "POST", "-f", f"labels[]={LABEL}", tries=1)
@@ -366,7 +366,7 @@ def pr_filter(text):
 def collect(start, end, apply, report, extra=""):
     """Removes the labels that need no judgment and returns the rest, oldest first."""
     # A search stops at SEARCH_LIMIT results, so oldest first lets the next search start from the last result
-    open_prs = f"repo:{REPO_OWNER}/{REPO_NAME} is:pr is:open sort:updated-asc {extra}".rstrip()
+    open_prs = f"repo:{REPOSITORY} is:pr is:open sort:updated-asc {extra}".rstrip()
     # Both searches run before any label changes, so that a failed search changes nothing
     found = [(labeled, search_all(q, start)) for labeled, q in ((True, f'{open_prs} label:"{LABEL}"'), (False, f'{open_prs} -label:"{LABEL}"'))]
     todo = []

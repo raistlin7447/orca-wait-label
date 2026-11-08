@@ -589,6 +589,13 @@ class Run(unittest.TestCase):
             w.main()
         self.assertEqual(str(stopped.exception), "answered 401: denied ::error::fake")
 
+    def test_a_repository_the_token_cannot_read_stops_the_run_before_any_search(self):
+        with mock.patch.object(w, "check_repository", side_effect=SystemExit("repository must be one the token can read")), \
+                mock.patch.object(w, "collect") as collect, mock.patch.object(sys, "argv", ["wait_label.py"]), \
+                self.assertRaisesRegex(SystemExit, "repository must be one the token can read"):
+            w.main()
+        collect.assert_not_called()
+
     def test_a_failed_search_stops_the_run_on_one_line(self):
         with mock.patch.object(w, "collect", side_effect=RuntimeError("gh api graphql failed: HTTP 502\nBad gateway")), \
                 mock.patch.object(w, "check_repository"), mock.patch.object(w, "ensure_label"), \
