@@ -176,15 +176,15 @@ class CopilotModel:
         self.loop = asyncio.new_event_loop()
         self.client = CopilotClient(github_token=self.token, mode="empty", env=model_env(),
                                     base_directory=tempfile.mkdtemp())
-        self.loop.run_until_complete(self.client.start())
-        if self.model:
-            try:
+        try:
+            self.loop.run_until_complete(self.client.start())
+            if self.model:
                 self.check(self.loop.run_until_complete(self.client.list_models()))
-            except Exception as error:
-                self.__exit__()
-                if isinstance(error, BadSetting):
-                    raise
-                raise RuntimeError(f"Copilot's model list failed: {error}") from None
+        except Exception as error:
+            self.__exit__()
+            if isinstance(error, BadSetting):
+                raise
+            raise RuntimeError(f"Copilot couldn't start: {error}") from None
         return self
 
     def check(self, available):

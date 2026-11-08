@@ -64,7 +64,10 @@ def choice(name, default, choices):
     return value
 
 
-REPO_OWNER, REPO_NAME = setting("REPO", os.environ.get("GITHUB_REPOSITORY", "/")).split("/")
+REPOSITORY = setting("REPO", os.environ.get("GITHUB_REPOSITORY", ""))
+if not re.fullmatch(r"[\w.-]+/[\w.-]+", REPOSITORY):
+    sys.exit(f"repository must be owner/name, not {REPOSITORY!r}")
+REPO_OWNER, REPO_NAME = REPOSITORY.split("/")
 LABEL = setting("LABEL", "waiting on author")
 LABEL_COLOR = setting("LABEL_COLOR", "fbca04").lstrip("#")
 if not re.fullmatch("[0-9a-fA-F]{6}", LABEL_COLOR):
@@ -297,6 +300,13 @@ def open_model():
 
 
 def ensure_label(apply):
+    # A search of a repository that doesn't exist finds nothing, so a typo would look like a quiet repository
+    try:
+        gh("api", f"repos/{REPO_OWNER}/{REPO_NAME}", "--jq", ".full_name")
+    except RuntimeError as error:
+        if "HTTP 404" in str(error):
+            sys.exit(f"repository must be one the token can read, not '{REPO_OWNER}/{REPO_NAME}'")
+        raise
     path = f"repos/{REPO_OWNER}/{REPO_NAME}/labels"
     try:
         gh("api", f"{path}/{quote(LABEL, safe='')}")
@@ -496,8 +506,12 @@ def main():
         print(f"No saved progress, so starting from {start or 'the oldest open PR'}")
 
     report = {"added": [], "removed": [], "judged": 0, "held": 0, "failures": 0, "unusable": 0, "failed_at": [], "usage": Usage()}
-    ensure_label(args.apply)
-    todo = collect(start, end, args.apply, report, extra)
+    # gh has already retried by now, so the run stops here and the next one starts from the same place
+    try:
+        ensure_label(args.apply)
+        todo = collect(start, end, args.apply, report, extra)
+    except RuntimeError as error:
+        sys.exit(one_line(error))
 
     if args.dump_prompts:
         with open(args.dump_prompts, "w", encoding="utf-8") as dump:

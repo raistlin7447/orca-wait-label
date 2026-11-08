@@ -449,23 +449,36 @@ class EnsureLabel(unittest.TestCase):
         for apply in (True, False):
             with mock.patch.object(w, "gh") as gh:
                 w.ensure_label(apply)
-            self.assertEqual(gh.call_count, 1)
+            self.assertEqual(gh.call_count, 2)
 
     def test_a_dry_run_reports_a_missing_label_without_creating_it(self):
         out = io.StringIO()
-        with mock.patch.object(w, "gh", side_effect=RuntimeError("HTTP 404")) as gh, contextlib.redirect_stdout(out):
+        with mock.patch.object(w, "gh", side_effect=["owner/repo", RuntimeError("HTTP 404")]) as gh, contextlib.redirect_stdout(out):
             w.ensure_label(False)
         self.assertIn("doesn't exist", out.getvalue())
-        self.assertEqual(gh.call_count, 1)
+        self.assertEqual(gh.call_count, 2)
 
     def test_a_real_run_creates_a_missing_label(self):
-        with mock.patch.object(w, "gh", side_effect=[RuntimeError("HTTP 404"), "{}"]) as gh:
+        with mock.patch.object(w, "gh", side_effect=["owner/repo", RuntimeError("HTTP 404"), "{}"]) as gh:
             w.ensure_label(True)
         self.assertIn("POST", gh.call_args.args)
 
     def test_other_errors_still_raise(self):
         with mock.patch.object(w, "gh", side_effect=RuntimeError("HTTP 500")), self.assertRaises(RuntimeError):
             w.ensure_label(False)
+
+    def test_a_repository_the_token_cannot_see_stops_the_run(self):
+        with mock.patch.object(w, "gh", side_effect=RuntimeError("HTTP 404")) as gh, \
+                self.assertRaisesRegex(SystemExit, "repository must be one the token can read, not 'owner/repo'"):
+            w.ensure_label(True)
+        self.assertEqual(gh.call_count, 1)
+
+    def test_a_repository_that_is_not_owner_and_name_stops_the_run(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for value in ("OrcaSlicer", "a/b/c", "https://github.com/a/b"):
+            out = subprocess.run([sys.executable, "-c", "import wait_label"], cwd=root, capture_output=True, text=True,
+                                 env=os.environ | {"WAIT_LABEL_REPO": value})
+            self.assertIn(f"repository must be owner/name, not {value!r}", out.stderr)
 
 
 class Action(unittest.TestCase):
@@ -562,6 +575,30 @@ class Run(unittest.TestCase):
                 self.assertRaises(SystemExit) as stopped:
             w.main()
         self.assertEqual(str(stopped.exception), "answered 401: denied ::error::fake")
+
+    def test_a_failed_search_stops_the_run_on_one_line(self):
+        with mock.patch.object(w, "collect", side_effect=RuntimeError("gh api graphql failed: HTTP 502\nBad gateway")), \
+                mock.patch.object(w, "ensure_label"), mock.patch.object(w, "write_state") as write, \
+                mock.patch.object(sys, "argv", ["wait_label.py"]), self.assertRaises(SystemExit) as stopped:
+            w.main()
+        self.assertEqual(str(stopped.exception), "gh api graphql failed: HTTP 502 Bad gateway")
+        write.assert_not_called()
+
+    def test_a_copilot_client_that_fails_to_start_is_cleaned_up(self):
+        class Client:
+            def __init__(self, **_):
+                pass
+
+            async def start(self):
+                raise FileNotFoundError("copilot binary")
+
+            async def stop(self):
+                pass
+        model = models.CopilotModel("auto", "s", {}, "t")
+        with mock.patch.dict(sys.modules, {"copilot": mock.Mock(CopilotClient=Client)}), \
+                self.assertRaisesRegex(RuntimeError, "Copilot couldn't start: copilot binary"):
+            model.__enter__()
+        self.assertTrue(model.loop.is_closed())
 
     def test_no_model_is_opened_with_nothing_to_judge(self):
         self.run_main([], ["--apply"])
@@ -840,7 +877,7 @@ class Providers(unittest.TestCase):
                 raise ConnectionError("denied")
         model, out = models.CopilotModel("auto", "s", {}, "t"), io.StringIO()
         with mock.patch.dict(sys.modules, {"copilot": mock.Mock(CopilotClient=Client)}), contextlib.redirect_stdout(out), \
-                self.assertRaisesRegex(RuntimeError, "Copilot's model list failed: denied"):
+                self.assertRaisesRegex(RuntimeError, "Copilot couldn't start: denied"):
             model.__enter__()
         self.assertTrue(Client.stopped and model.loop.is_closed())
         self.assertIn("didn't stop cleanly: already gone ::error::fake", out.getvalue())
