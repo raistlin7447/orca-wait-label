@@ -38,6 +38,11 @@ LOOKUP_TRIES, LOOKUP_RETRY_DELAY, LOOKUP_TIMEOUT = 3, 10, 30
 SECRET_WORDS = ("TOKEN", "SECRET", "PASSWORD", "KEY")
 
 
+def one_line(text):
+    """Text for the log, where a line starting with :: would be a workflow command."""
+    return " ".join(str(text).split())
+
+
 def answer_json(text):
     try:
         return json.loads(text)
@@ -92,12 +97,13 @@ class ClaudeModel:
             # The CLI gets the full ID, so that it runs the model checked here
             self.model = info["id"]
         effort = (info.get("capabilities") or {}).get("effort")
+        levels = [k for k, v in (effort or {}).items() if isinstance(v, dict) and v.get("supported")]
         # A gateway's model list may leave out what each model supports
-        if effort is None:
+        if effort is None or (effort.get("supported") and not levels):
             if self.effort:
                 print(f"The model list doesn't say which efforts {self.model} takes, so effort goes to Claude unchecked")
             return self
-        check_effort(self.model, self.effort, [k for k, v in effort.items() if isinstance(v, dict) and v.get("supported")])
+        check_effort(self.model, self.effort, levels)
         return self
 
     def __exit__(self, *_):
@@ -189,11 +195,11 @@ class CopilotModel:
         check_effort(self.model, self.effort, info.supported_reasoning_efforts or [])
 
     def __exit__(self, *_):
-        # The judging is done by now, so a client that fails to stop only gets a warning
+        # A client that fails to stop gets only a warning, so it can't fail a finished run or hide why the check failed
         try:
             self.loop.run_until_complete(self.client.stop())
         except Exception as error:
-            print(f"::warning::The Copilot client didn't stop cleanly: {error}")
+            print(f"::warning::The Copilot client didn't stop cleanly: {one_line(error)}")
         finally:
             self.loop.close()
 

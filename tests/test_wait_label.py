@@ -792,6 +792,10 @@ class Providers(unittest.TestCase):
     def test_null_capabilities_or_a_bare_effort_level_do_not_crash(self):
         with self.answers(None, {"data": [{"id": "claude-sonnet-5-5", "capabilities": None}]}), contextlib.redirect_stdout(io.StringIO()):
             self.claude(effort="high")
+        out = io.StringIO()
+        with self.answers({"id": "m", "capabilities": {"effort": {"supported": True}}}), contextlib.redirect_stdout(out):
+            self.claude("m", "high")
+        self.assertIn("effort goes to Claude unchecked", out.getvalue())
         bare = {"id": "m", "capabilities": {"effort": {"supported": True, "high": {}, "low": {"supported": True}}}}
         with self.answers(bare), self.assertRaisesRegex(models.BadSetting, "effort must be one of low for m"):
             self.claude("m", "high")
@@ -820,7 +824,7 @@ class Providers(unittest.TestCase):
 
             async def stop(self):
                 Client.stopped = True
-                raise ConnectionError("already gone")
+                raise ConnectionError("already gone\n::error::fake")
 
             async def list_models(self):
                 raise ConnectionError("denied")
@@ -829,7 +833,8 @@ class Providers(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "Copilot's model list failed: denied"):
             model.__enter__()
         self.assertTrue(Client.stopped and model.loop.is_closed())
-        self.assertIn("didn't stop cleanly: already gone", out.getvalue())
+        self.assertIn("didn't stop cleanly: already gone ::error::fake", out.getvalue())
+        self.assertFalse(any(line.startswith("::error") for line in out.getvalue().splitlines()))
 
     def test_copilot_checks_effort_against_the_model(self):
         model = models.CopilotModel("kimi-k3", "s", {}, "t", effort="medium")

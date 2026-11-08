@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
-from models import BadSetting, ClaudeModel, CopilotModel, UnusableAnswer, Usage
+from models import BadSetting, ClaudeModel, CopilotModel, UnusableAnswer, Usage, one_line
 
 
 def setting(name, default):
@@ -161,11 +161,6 @@ SCHEMA = {
     "properties": {"waiting_on_author": {"type": "boolean"}, "reason": {"type": "string"}},
     "required": ["waiting_on_author", "reason"],
 }
-
-
-def one_line(text):
-    """Text for the log, where a line starting with :: would be a workflow command."""
-    return " ".join(str(text).split())
 
 
 def gh(*args, tries=GITHUB_TRIES):
