@@ -553,6 +553,16 @@ class Run(unittest.TestCase):
             w.main()
         write.assert_not_called()
 
+    def test_a_startup_error_stays_on_one_line(self):
+        fake = mock.MagicMock()
+        fake.__enter__.side_effect = RuntimeError("answered 401: denied\n::error::fake")
+        with mock.patch.object(w, "open_model", return_value=fake), \
+                mock.patch.object(w, "collect", return_value=[("2026-01-02T00:00:00Z", 1, False, "p")]), \
+                mock.patch.object(w, "ensure_label"), mock.patch.object(sys, "argv", ["wait_label.py"]), \
+                self.assertRaises(SystemExit) as stopped:
+            w.main()
+        self.assertEqual(str(stopped.exception), "answered 401: denied ::error::fake")
+
     def test_no_model_is_opened_with_nothing_to_judge(self):
         self.run_main([], ["--apply"])
         self.assertFalse(self.opened)

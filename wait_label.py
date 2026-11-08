@@ -525,7 +525,7 @@ def main():
             with open_model() as model:
                 judge_all(todo, model, args.apply, report, checkpoint)
         except (BadSetting, RuntimeError) as error:
-            sys.exit(str(error))
+            sys.exit(one_line(error))
     through, retries = progress(todo, len(todo), start, end, report, retries)
     all_failed = todo and report["failures"] == len(todo)
     # Every PR failing means a token or the model service is broken, unless each failure was an answer that didn't fit
