@@ -299,14 +299,17 @@ def open_model():
     return CopilotModel(MODEL or None, SYSTEM_PROMPT, SCHEMA, os.environ.get("WAIT_LABEL_COPILOT_TOKEN"), MODEL_TIMEOUT, EFFORT)
 
 
-def ensure_label(apply):
-    # A search of a repository that doesn't exist finds nothing, so a typo would look like a quiet repository
+def check_repository():
+    # A search of a missing repository finds nothing, so a typo would otherwise look like a repository with no PRs
     try:
-        gh("api", f"repos/{REPO_OWNER}/{REPO_NAME}", "--jq", ".full_name")
+        gh("api", f"repos/{REPOSITORY}", "--jq", ".full_name")
     except RuntimeError as error:
         if "HTTP 404" in str(error):
-            sys.exit(f"repository must be one the token can read, not '{REPO_OWNER}/{REPO_NAME}'")
+            sys.exit(f"repository must be one the token can read, not {REPOSITORY!r}")
         raise
+
+
+def ensure_label(apply):
     path = f"repos/{REPO_OWNER}/{REPO_NAME}/labels"
     try:
         gh("api", f"{path}/{quote(LABEL, safe='')}")
@@ -506,8 +509,9 @@ def main():
         print(f"No saved progress, so starting from {start or 'the oldest open PR'}")
 
     report = {"added": [], "removed": [], "judged": 0, "held": 0, "failures": 0, "unusable": 0, "failed_at": [], "usage": Usage()}
-    # gh has already retried by now, so the run stops here and the next one starts from the same place
+    # Progress isn't saved, so the next run starts the search from the same place
     try:
+        check_repository()
         ensure_label(args.apply)
         todo = collect(start, end, args.apply, report, extra)
     except RuntimeError as error:

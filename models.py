@@ -180,10 +180,11 @@ class CopilotModel:
             self.loop.run_until_complete(self.client.start())
             if self.model:
                 self.check(self.loop.run_until_complete(self.client.list_models()))
+        except BadSetting:
+            self.__exit__()
+            raise
         except Exception as error:
             self.__exit__()
-            if isinstance(error, BadSetting):
-                raise
             raise RuntimeError(f"Copilot couldn't start: {error}") from None
         return self
 

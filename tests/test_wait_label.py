@@ -449,17 +449,17 @@ class EnsureLabel(unittest.TestCase):
         for apply in (True, False):
             with mock.patch.object(w, "gh") as gh:
                 w.ensure_label(apply)
-            self.assertEqual(gh.call_count, 2)
+            self.assertEqual(gh.call_count, 1)
 
     def test_a_dry_run_reports_a_missing_label_without_creating_it(self):
         out = io.StringIO()
-        with mock.patch.object(w, "gh", side_effect=["owner/repo", RuntimeError("HTTP 404")]) as gh, contextlib.redirect_stdout(out):
+        with mock.patch.object(w, "gh", side_effect=RuntimeError("HTTP 404")) as gh, contextlib.redirect_stdout(out):
             w.ensure_label(False)
         self.assertIn("doesn't exist", out.getvalue())
-        self.assertEqual(gh.call_count, 2)
+        self.assertEqual(gh.call_count, 1)
 
     def test_a_real_run_creates_a_missing_label(self):
-        with mock.patch.object(w, "gh", side_effect=["owner/repo", RuntimeError("HTTP 404"), "{}"]) as gh:
+        with mock.patch.object(w, "gh", side_effect=[RuntimeError("HTTP 404"), "{}"]) as gh:
             w.ensure_label(True)
         self.assertIn("POST", gh.call_args.args)
 
@@ -467,11 +467,21 @@ class EnsureLabel(unittest.TestCase):
         with mock.patch.object(w, "gh", side_effect=RuntimeError("HTTP 500")), self.assertRaises(RuntimeError):
             w.ensure_label(False)
 
+
+class CheckRepository(unittest.TestCase):
+    def test_a_readable_repository_passes(self):
+        with mock.patch.object(w, "gh", return_value="owner/repo") as gh:
+            w.check_repository()
+        self.assertEqual(gh.call_args.args[:2], ("api", "repos/owner/repo"))
+
     def test_a_repository_the_token_cannot_see_stops_the_run(self):
-        with mock.patch.object(w, "gh", side_effect=RuntimeError("HTTP 404")) as gh, \
+        with mock.patch.object(w, "gh", side_effect=RuntimeError("HTTP 404")), \
                 self.assertRaisesRegex(SystemExit, "repository must be one the token can read, not 'owner/repo'"):
-            w.ensure_label(True)
-        self.assertEqual(gh.call_count, 1)
+            w.check_repository()
+
+    def test_other_errors_still_raise(self):
+        with mock.patch.object(w, "gh", side_effect=RuntimeError("HTTP 500")), self.assertRaises(RuntimeError):
+            w.check_repository()
 
     def test_a_repository_that_is_not_owner_and_name_stops_the_run(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -502,7 +512,8 @@ class Run(unittest.TestCase):
         fake = mock.MagicMock()
         fake.__enter__.return_value = model or FakeModel(*[False] * 10)
         with mock.patch.object(w, "STATE_FILE", path), mock.patch.object(w, "MAX_JUDGMENTS", 2), \
-                mock.patch.object(w, "collect", side_effect=lambda s, e, a, r, x: todo) as collect, mock.patch.object(w, "ensure_label"), \
+                mock.patch.object(w, "collect", side_effect=lambda s, e, a, r, x: todo) as collect, \
+                mock.patch.object(w, "check_repository"), mock.patch.object(w, "ensure_label"), \
                 mock.patch.object(w, "open_model", return_value=fake) as open_model, \
                 mock.patch.object(w, "set_label"), mock.patch.object(sys, "argv", ["wait_label.py", *argv]):
             w.main()
@@ -561,7 +572,8 @@ class Run(unittest.TestCase):
         fake.__enter__.side_effect = models.BadSetting("model must be one of a, b, not 'c'")
         with mock.patch.object(w, "open_model", return_value=fake), mock.patch.object(w, "write_state") as write, \
                 mock.patch.object(w, "collect", return_value=[("2026-01-02T00:00:00Z", 1, False, "p")]), \
-                mock.patch.object(w, "ensure_label"), mock.patch.object(sys, "argv", ["wait_label.py"]), \
+                mock.patch.object(w, "check_repository"), mock.patch.object(w, "ensure_label"), \
+                mock.patch.object(sys, "argv", ["wait_label.py"]), \
                 self.assertRaisesRegex(SystemExit, "model must be one of a, b"):
             w.main()
         write.assert_not_called()
@@ -571,14 +583,16 @@ class Run(unittest.TestCase):
         fake.__enter__.side_effect = RuntimeError("answered 401: denied\n::error::fake")
         with mock.patch.object(w, "open_model", return_value=fake), \
                 mock.patch.object(w, "collect", return_value=[("2026-01-02T00:00:00Z", 1, False, "p")]), \
-                mock.patch.object(w, "ensure_label"), mock.patch.object(sys, "argv", ["wait_label.py"]), \
+                mock.patch.object(w, "check_repository"), mock.patch.object(w, "ensure_label"), \
+                mock.patch.object(sys, "argv", ["wait_label.py"]), \
                 self.assertRaises(SystemExit) as stopped:
             w.main()
         self.assertEqual(str(stopped.exception), "answered 401: denied ::error::fake")
 
     def test_a_failed_search_stops_the_run_on_one_line(self):
         with mock.patch.object(w, "collect", side_effect=RuntimeError("gh api graphql failed: HTTP 502\nBad gateway")), \
-                mock.patch.object(w, "ensure_label"), mock.patch.object(w, "write_state") as write, \
+                mock.patch.object(w, "check_repository"), mock.patch.object(w, "ensure_label"), \
+                mock.patch.object(w, "write_state") as write, \
                 mock.patch.object(sys, "argv", ["wait_label.py"]), self.assertRaises(SystemExit) as stopped:
             w.main()
         self.assertEqual(str(stopped.exception), "gh api graphql failed: HTTP 502 Bad gateway")
