@@ -91,13 +91,13 @@ class ClaudeModel:
                 print(f"Using {info['id']} for model {self.model}")
             # The CLI gets the full ID, so that it runs the model checked here
             self.model = info["id"]
-        effort = info.get("capabilities", {}).get("effort")
+        effort = (info.get("capabilities") or {}).get("effort")
         # A gateway's model list may leave out what each model supports
         if effort is None:
             if self.effort:
                 print(f"The model list doesn't say which efforts {self.model} takes, so effort goes to Claude unchecked")
             return self
-        check_effort(self.model, self.effort, [k for k, v in effort.items() if isinstance(v, dict) and v["supported"]])
+        check_effort(self.model, self.effort, [k for k, v in effort.items() if isinstance(v, dict) and v.get("supported")])
         return self
 
     def __exit__(self, *_):
@@ -175,11 +175,7 @@ class CopilotModel:
             try:
                 self.check(self.loop.run_until_complete(self.client.list_models()))
             except Exception as error:
-                # A client that fails to stop must not hide why the check failed
-                try:
-                    self.__exit__()
-                except Exception:
-                    pass
+                self.__exit__()
                 if isinstance(error, BadSetting):
                     raise
                 raise RuntimeError(f"Copilot's model list failed: {error}") from None
@@ -193,8 +189,11 @@ class CopilotModel:
         check_effort(self.model, self.effort, info.supported_reasoning_efforts or [])
 
     def __exit__(self, *_):
+        # The judging is done by now, so a client that fails to stop only gets a warning
         try:
             self.loop.run_until_complete(self.client.stop())
+        except Exception as error:
+            print(f"::warning::The Copilot client didn't stop cleanly: {error}")
         finally:
             self.loop.close()
 
